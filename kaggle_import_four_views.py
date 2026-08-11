@@ -57,6 +57,23 @@ def _option_value(arguments: list[str], option: str, default: str | None = None)
     return default
 
 
+def _without_option(arguments: list[str], option: str) -> list[str]:
+    """Remove one ``--option value`` or ``--option=value`` pair safely."""
+
+    result: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == option:
+            index += 2
+        elif argument.startswith(f"{option}="):
+            index += 1
+        else:
+            result.append(argument)
+            index += 1
+    return result
+
+
 def resolve_input_dir(value: str | None) -> Path:
     """Resolve a supplied folder, or the two known Kaggle mount variants."""
 
@@ -79,7 +96,15 @@ def validate_four_views(input_dir: Path) -> list[Path]:
     paths: list[Path] = []
     missing: list[str] = []
     for angle in ANGLES:
-        aliases = {f"view_{angle:03d}", f"view{angle:03d}", str(angle)}
+        # Cameras are commonly named either view_090.png or view_90.png.
+        # Accept both, while preserving the required [0, 90, 180, 270] order.
+        aliases = {
+            f"view_{angle:03d}",
+            f"view{angle:03d}",
+            f"view_{angle}",
+            f"view{angle}",
+            str(angle),
+        }
         matches = sorted(
             path
             for path in input_dir.iterdir()
@@ -178,8 +203,11 @@ def main(arguments: list[str] | None = None) -> None:
     if not skip_bootstrap:
         bootstrap(repo_root, lgm_root, force_bootstrap)
 
-    if not _has_option(arguments, "--input-dir"):
-        arguments.extend(("--input-dir", str(input_dir)))
+    # Pass the validated paths directly. This lets this launcher accept common
+    # non-padded camera names such as view_90.png even though the shared runner
+    # itself intentionally defaults to the strict canonical file layout.
+    arguments = _without_option(arguments, "--input-dir")
+    arguments.extend(("--views", *(str(path) for path in view_paths)))
     if not _has_option(arguments, "--lgm-root"):
         arguments.extend(("--lgm-root", str(lgm_root)))
     if not _has_option(arguments, "--lgm-device"):

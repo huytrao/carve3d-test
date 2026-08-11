@@ -23,6 +23,9 @@ All material pipeline changes are recorded here.
 - The launcher supports both the supplied input path
   `/kaggle/input/datasets/traoanhuy/carve3d/views` and Kaggle's usual mounted
   path `/kaggle/input/carve3d/views` when no `--input-dir` is supplied.
+- It accepts both padded names such as `view_090.png` and common non-padded
+  names such as `view_90.png`, then passes the validated paths in fixed camera
+  order to the reconstructor.
 
 ## Earlier work — `implement_full_pipeline`
 

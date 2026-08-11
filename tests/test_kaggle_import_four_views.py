@@ -19,6 +19,15 @@ class KaggleImportFourViewsTest(unittest.TestCase):
             result = validate_four_views(directory)
         self.assertEqual([path.name for path in result], ["view_000.png", "view_090.png", "view_180.png", "view_270.png"])
 
+    def test_validate_four_views_accepts_non_padded_camera_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write_views(directory)
+            (directory / "view_090.png").unlink()
+            (directory / "view_90.png").write_bytes(b"test")
+            result = validate_four_views(directory)
+        self.assertEqual(result[1].name, "view_90.png")
+
     def test_validate_four_views_names_missing_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
