@@ -61,7 +61,11 @@ def _has_launcher(directory: Path) -> bool:
 def resolve_pipeline_repository() -> Path:
     """Return a repo containing the launcher, cloning it when run standalone."""
 
-    script_directory = Path(__file__).resolve().parent
+    # `__file__` exists when the file is executed with Python, but not when a
+    # user pastes its contents into a Kaggle/Jupyter code cell. In that case
+    # fall back to the notebook working directory and bootstrap from there.
+    script_file = globals().get("__file__")
+    script_directory = Path(script_file).resolve().parent if script_file else Path.cwd()
     if _has_launcher(script_directory):
         return script_directory
 

@@ -5,6 +5,7 @@ from unittest.mock import patch
 from pathlib import Path
 import tempfile
 
+import run_full_pipeline
 from run_full_pipeline import DEFAULT_PROMPT, _has_launcher, build_pipeline_arguments
 
 
@@ -36,6 +37,14 @@ class SavedRunCommandTest(unittest.TestCase):
             self.assertFalse(_has_launcher(root))
             (root / "kaggle_full_pipeline_prompt.py").touch()
             self.assertTrue(_has_launcher(root))
+
+    def test_notebook_cell_without_dunder_file_uses_current_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "kaggle_full_pipeline_prompt.py").touch()
+            with patch.dict(run_full_pipeline.__dict__, {"__file__": None}):
+                with patch("run_full_pipeline.Path.cwd", return_value=root):
+                    self.assertEqual(run_full_pipeline.resolve_pipeline_repository(), root)
 
 
 if __name__ == "__main__":
