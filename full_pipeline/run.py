@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--elevation", type=float, default=0.0, help="Common elevation in degrees for all four input cameras.")
     parser.add_argument("--render-size", type=int, default=512, help="Output render edge length; 256 lowers GPU use.")
     parser.add_argument("--mrc-metric", choices=("lpips", "l1"), default="lpips", help="LPIPS is Carve3D MRC; L1 is only a dependency-light smoke-test metric.")
+    parser.add_argument("--lgm-device", type=int, default=0, help="CUDA device used for LGM reconstruction, rendering and MRC.")
+    parser.add_argument("--prompt-device", type=int, default=0, help="CUDA device used for MVDream in --prompt mode.")
     parser.add_argument("--no-remove-background", dest="remove_background", action="store_false", help="Keep existing image backgrounds. Normally real images should be mattes on white.")
     parser.add_argument("--no-recenter", dest="recenter", action="store_false", help="Do not center/crop each foreground matte.")
     parser.add_argument("--no-orbit", dest="orbit", action="store_false", help="Skip 360-degree preview video.")
@@ -78,7 +80,7 @@ def find_view_paths(input_dir: Path) -> list[Path]:
     return paths
 
 
-def _load_lgm(lgm_root: Path, checkpoint: Path, preset: str, render_size: int):
+def _load_lgm(lgm_root: Path, checkpoint: Path, preset: str, render_size: int, device_index: int):
     """Load LGM through its official modules, keeping this repo dependency-light."""
 
     if not lgm_root.is_dir():
@@ -99,13 +101,20 @@ def _load_lgm(lgm_root: Path, checkpoint: Path, preset: str, render_size: int):
 
     if not torch.cuda.is_available():
         raise RuntimeError("LGM Gaussian rasterization requires a CUDA GPU. Enable a Kaggle GPU accelerator.")
+    if not 0 <= device_index < torch.cuda.device_count():
+        raise RuntimeError(
+            f"--lgm-device {device_index} is unavailable; detected {torch.cuda.device_count()} CUDA device(s)."
+        )
     opt = config_defaults[preset]
     opt.output_size = render_size
     opt.lambda_lpips = 0.0  # MRC uses its own AlexNet LPIPS metric below.
     model = LGM(opt)
     model.load_state_dict(load_file(str(checkpoint), device="cpu"), strict=False)
-    device = torch.device("cuda")
+    device = torch.device(f"cuda:{device_index}")
     model = model.half().to(device).eval()
+    # LGM initializes this field on GPU 0. Move it explicitly so the original
+    # Gaussian renderer works on GPU 1 in a dual-T4 Kaggle session too.
+    model.gs.bg_color = model.gs.bg_color.to(device)
     return model, opt, device
 
 
@@ -164,11 +173,19 @@ def _source_views_from_prompt(prompt: str, seed: int, device, elevation: float) 
     pipe = MVDreamPipeline.from_pretrained(
         MVDREAM_CHECKPOINT, torch_dtype=torch.float16, trust_remote_code=True
     ).to(device)
-    generated = pipe(prompt, negative_prompt="", num_inference_steps=30, guidance_scale=7.5, elevation=elevation)
+    generated = pipe(
+        prompt,
+        negative_prompt="",
+        num_inference_steps=30,
+        guidance_scale=7.5,
+        elevation=elevation,
+        device=device,
+    )
     # The reconstructor is already resident on the GPU.  Release MVDream before
     # LGM's forward pass so a 16 GB Kaggle GPU has the largest practical margin.
     del pipe
-    torch.cuda.empty_cache()
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
     # This reorder is the official LGM/MVDream convention: these source images
     # align with LGM rays [0, 90, 180, 270].
     return [
@@ -209,19 +226,32 @@ def _save_orbit(model, opt, device, gaussians, output_path: Path, elevation: flo
 
 def main() -> None:
     args = parse_args()
+    import torch
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = args.checkpoint or args.lgm_root / "pretrained" / "model_fp16_fixrot.safetensors"
-    model, opt, device = _load_lgm(args.lgm_root, checkpoint, args.preset, args.render_size)
+    model, opt, device = _load_lgm(
+        args.lgm_root, checkpoint, args.preset, args.render_size, args.lgm_device
+    )
 
     if args.prompt:
-        source_views = _source_views_from_prompt(args.prompt, args.seed, device, args.elevation)
-        source_description = {"mode": "open_mvdream_prompt", "prompt": args.prompt, "seed": args.seed}
+        if not 0 <= args.prompt_device < torch.cuda.device_count():
+            raise RuntimeError(
+                f"--prompt-device {args.prompt_device} is unavailable; detected {torch.cuda.device_count()} CUDA device(s)."
+            )
+        prompt_device = torch.device(f"cuda:{args.prompt_device}")
+        source_views = _source_views_from_prompt(args.prompt, args.seed, prompt_device, args.elevation)
+        source_description = {
+            "mode": "open_mvdream_prompt",
+            "prompt": args.prompt,
+            "seed": args.seed,
+            "mvdream_device": args.prompt_device,
+        }
     else:
         paths = list(args.views) if args.views else find_view_paths(args.input_dir)
         source_views = [_prepare_image(path, args.remove_background, args.recenter) for path in paths]
         source_description = {"mode": "four_real_views", "paths": [str(path) for path in paths]}
 
-    import torch
     import torch.nn.functional as F
 
     if len(source_views) != 4:
@@ -264,6 +294,7 @@ def main() -> None:
         "angles_degrees": list(ANGLES),
         "elevation_degrees": args.elevation,
         "render_size": args.render_size,
+        "lgm_device": args.lgm_device,
         "preprocessing": {
             "remove_background": args.remove_background,
             "recenter_foreground": args.recenter,

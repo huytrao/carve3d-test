@@ -69,6 +69,11 @@ python full_pipeline/run.py \
   --output-dir outputs/chair_prompt
 ```
 
+For Kaggle's **T4 x2** accelerator, run
+`kaggle_full_pipeline_prompt.py` instead. It automatically uses GPU 0 for
+MVDream and GPU 1 for LGM/MRC, and runs the LGM/checkpoint bootstrap on its
+first invocation. Pass `--no-bootstrap` only after setup has completed.
+
 Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
 test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
 Lower MRC is better.  The precise source order and all checkpoint metadata are
