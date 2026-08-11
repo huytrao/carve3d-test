@@ -70,6 +70,9 @@ All material pipeline changes are recorded here.
 - Show a labelled 2×2 preview of the exact 000/090/180/270 source files at
   the start of the one-cell Kaggle run, before LGM is loaded or calibration
   begins.
+- Accept the obsolete `--refine-*` flags used by previously copied Kaggle
+  cells, automatically mapping them to safe forward-only appearance search so
+  the old cell does not fail argument parsing.
 
 ## Earlier work — `implement_full_pipeline`
 

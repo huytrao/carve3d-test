@@ -56,6 +56,15 @@ class FindViewPathsTest(unittest.TestCase):
             args = parse_args()
         self.assertTrue(args.appearance_search)
 
+    def test_accepts_legacy_refinement_flags_for_old_kaggle_cells(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["run.py", "--input-dir", "/tmp/views", "--refine-steps", "120"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.refine_steps, 120)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,12 @@ def parse_args() -> argparse.Namespace:
             "using forward rasterization only, retaining the lowest MRC result."
         ),
     )
+    # Compatibility for Kaggle cells copied before the CUDA rasterizer
+    # backward issue was discovered. These values are intentionally ignored;
+    # their presence selects the safe forward-only appearance search below.
+    parser.add_argument("--refine-steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--refine-learning-rate", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--refine-eval-every", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--lgm-device", type=int, default=0, help="CUDA device used for LGM reconstruction, rendering and MRC.")
     parser.add_argument("--prompt-device", type=int, default=0, help="CUDA device used for MVDream in --prompt mode.")
     parser.add_argument("--no-remove-background", dest="remove_background", action="store_false", help="Keep existing image backgrounds. Normally real images should be mattes on white.")
@@ -356,6 +362,16 @@ def main() -> None:
     args = parse_args()
     import torch
 
+    legacy_refinement_flags = any(
+        value is not None for value in (args.refine_steps, args.refine_learning_rate, args.refine_eval_every)
+    )
+    if legacy_refinement_flags:
+        args.appearance_search = True
+        print(
+            "Deprecated --refine-* flags detected. Using safe forward-only --appearance-search instead; "
+            "no CUDA backward will run.",
+            flush=True,
+        )
     if args.appearance_search and args.prompt:
         raise ValueError("--appearance-search is for four real input views, not --prompt mode.")
 
