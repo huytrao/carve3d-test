@@ -52,16 +52,21 @@ same `0.2` KL coefficient. The source MVDream/LGM replacement has a different
 architecture and reward implementation, so this is not a claim that the
 resulting weights are compatible with the unavailable Instant3D model.
 
-## Real four-photo refinement
+## Real four-photo calibration
 
 The default Kaggle run now prioritizes the requested real-image task. It
 tries a small common-elevation grid, starts from LGM's best feed-forward
-Gaussian result, and directly optimizes bounded position, opacity, scale, and
-colour deltas across the same four camera views. Its foreground-weighted L1
-objective gives a differentiable fitting signal; LPIPS MRC is evaluated every
-ten steps and only the lowest-MRC Gaussian state is exported. The console line
-`[Refine step/120]` is the progress to judge, not the unrelated prompt-RL
-validation metric.
+Gaussian result, calculates a bounded global RGB affine fit from the same four
+camera views, and searches that fit plus modest opacity/scale candidates.
+Every candidate uses the forward renderer and LPIPS MRC; only the lowest-MRC
+Gaussian state is exported. The console lines beginning `[Appearance]` are the
+progress to judge, not the unrelated prompt-RL validation metric.
+
+The first direct-gradient refinement implementation is intentionally not used:
+the `diff-gaussian-rasterization` CUDA backward kernel produced an illegal
+memory-access error on Kaggle T4/Python 3.12. Forward-only calibration is less
+expressive, but it is reproducible on this environment and never invokes the
+failing kernel.
 
 Prompt RL remains in `code.txt` behind `RUN_PROMPT_RLFT = False` for
 algorithmic research. It is disabled by default because it fine-tunes the

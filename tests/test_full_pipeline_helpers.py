@@ -42,7 +42,7 @@ class FindViewPathsTest(unittest.TestCase):
             args = parse_args()
         self.assertEqual(args.elevation_candidates, [-10.0, -5.0, 0.0, 5.0, 10.0])
 
-    def test_exposes_direct_gaussian_refinement_arguments(self):
+    def test_exposes_safe_direct_appearance_search_argument(self):
         with patch.object(
             sys,
             "argv",
@@ -50,18 +50,11 @@ class FindViewPathsTest(unittest.TestCase):
                 "run.py",
                 "--input-dir",
                 "/tmp/views",
-                "--refine-steps",
-                "120",
-                "--refine-learning-rate",
-                "0.02",
-                "--refine-eval-every",
-                "10",
+                "--appearance-search",
             ],
         ):
             args = parse_args()
-        self.assertEqual(args.refine_steps, 120)
-        self.assertEqual(args.refine_learning_rate, 0.02)
-        self.assertEqual(args.refine_eval_every, 10)
+        self.assertTrue(args.appearance_search)
 
 
 if __name__ == "__main__":

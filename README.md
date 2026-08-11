@@ -98,11 +98,12 @@ The current `code.txt` additionally tries common capture elevations
 (-10/-5/0/+5/+10 degrees) for the real four photos, keeps the lowest
 same-camera LPIPS MRC result, and records all candidate scores in
 `metrics.json`. This is a camera-alignment search, not a claim that MRC alone
-is ground-truth 3D accuracy. It then runs 120 bounded Gaussian-refinement
-steps against the same four photos, retaining the lowest-MRC checkpoint and
-printing `[Refine step/120]` metrics every 10 steps. This direct refinement is
-the relevant improvement path for real input; prompt LoRA RL is optional and
-does not modify the resulting four-photo reconstruction.
+is ground-truth 3D accuracy. It then safely searches global RGB, opacity, and
+scale calibration candidates using LGM's forward renderer only, retaining the
+lowest-MRC result and printing `[Appearance]` candidate metrics. This avoids
+the unstable CUDA backward kernel seen with current Kaggle T4 builds. Prompt
+LoRA RL is optional and does not modify the resulting four-photo
+reconstruction.
 
 ### Local command
 
