@@ -73,6 +73,9 @@ All material pipeline changes are recorded here.
 - Accept the obsolete `--refine-*` flags used by previously copied Kaggle
   cells, automatically mapping them to safe forward-only appearance search so
   the old cell does not fail argument parsing.
+- Re-enable the actual public-MVDream LoRA RLFT stage by default after direct
+  four-photo reconstruction, while documenting that it writes a separate
+  prompt-model experiment rather than changing the exported direct PLY.
 
 ## Earlier work — `implement_full_pipeline`
 

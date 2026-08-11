@@ -34,9 +34,10 @@ RLFT_OUTPUT_DIR = WORKDIR / "carve3d-open-rlft-output-v3"
 # calibration candidates. It never invokes the unstable CUDA backward kernel.
 DIRECT_APPEARANCE_SEARCH = True
 
-# Leave False for real four-photo reconstruction. Prompt RL trains MVDream on
-# generic prompts and does not alter the direct reconstruction above.
-RUN_PROMPT_RLFT = False
+# This runs actual LoRA RLFT after direct reconstruction. It trains the public
+# MVDream prompt model (GPU 0) with LGM/MRC reward (GPU 1); it is a separate
+# paper-style experiment and does not modify the direct four-photo PLY above.
+RUN_PROMPT_RLFT = True
 
 # Conservative quality profile for T4 x2. Each update scores eight random
 # noises for one prompt, then transactional held-out validation retains an

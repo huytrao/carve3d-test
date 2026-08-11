@@ -68,7 +68,8 @@ memory-access error on Kaggle T4/Python 3.12. Forward-only calibration is less
 expressive, but it is reproducible on this environment and never invokes the
 failing kernel.
 
-Prompt RL remains in `code.txt` behind `RUN_PROMPT_RLFT = False` for
-algorithmic research. It is disabled by default because it fine-tunes the
-public MVDream prompt model and cannot change a reconstruction initialized
-from the user's four real images.
+Prompt RL runs after direct reconstruction in `code.txt` as a separate
+algorithmic experiment. It fine-tunes the public MVDream prompt model and
+still cannot change a reconstruction initialized from the user's four real
+images; its checkpoint and MRC are written under the separate RLFT output
+directory.
