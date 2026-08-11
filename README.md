@@ -74,6 +74,16 @@ For Kaggle's **T4 x2** accelerator, run
 MVDream and GPU 1 for LGM/MRC, and runs the LGM/checkpoint bootstrap on its
 first invocation. Pass `--no-bootstrap` only after setup has completed.
 
+For the simplest reproducible Kaggle prompt run, use the saved command in
+`run_full_pipeline.py`:
+
+```bash
+python run_full_pipeline.py
+```
+
+Override its prompt without editing code with
+`CARVE3D_PROMPT="a ceramic teapot, studio product photograph, centered object, white background" python run_full_pipeline.py`.
+
 Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
 test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
 Lower MRC is better.  The precise source order and all checkpoint metadata are
