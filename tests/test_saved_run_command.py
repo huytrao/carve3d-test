@@ -2,7 +2,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-from run_full_pipeline import DEFAULT_PROMPT, build_pipeline_arguments
+from pathlib import Path
+import tempfile
+
+from run_full_pipeline import DEFAULT_PROMPT, _has_launcher, build_pipeline_arguments
 
 
 class SavedRunCommandTest(unittest.TestCase):
@@ -26,6 +29,13 @@ class SavedRunCommandTest(unittest.TestCase):
         self.assertEqual(arguments[arguments.index("--prompt") + 1], "a ceramic teapot")
         self.assertEqual(arguments[arguments.index("--output-dir") + 1], "/tmp/out")
         self.assertEqual(arguments[-3:], ["--render-size", "256", "--no-orbit"])
+
+    def test_launcher_detection_requires_the_actual_runner_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertFalse(_has_launcher(root))
+            (root / "kaggle_full_pipeline_prompt.py").touch()
+            self.assertTrue(_has_launcher(root))
 
 
 if __name__ == "__main__":
