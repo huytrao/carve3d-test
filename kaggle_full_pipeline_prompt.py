@@ -23,6 +23,8 @@ from pathlib import Path
 
 
 DEFAULT_LGM_ROOT = Path("/kaggle/working/LGM")
+LGM_CHECKPOINT_URL = "https://huggingface.co/ashawkey/LGM/resolve/main/model_fp16_fixrot.safetensors"
+MVDREAM_MODEL_URL = "https://huggingface.co/ashawkey/mvdream-sd2.1-diffusers"
 
 
 def _has_option(arguments: list[str], option: str) -> bool:
@@ -65,7 +67,9 @@ print('Using GPU 1:', torch.cuda.get_device_name(1))
 def _bootstrap(repo_root: Path, lgm_root: Path, force: bool) -> None:
     checkpoint = lgm_root / "pretrained" / "model_fp16_fixrot.safetensors"
     if force or not checkpoint.is_file():
+        print(f"Downloading LGM checkpoint from: {LGM_CHECKPOINT_URL}")
         subprocess.run(["bash", str(repo_root / "scripts" / "setup_lgm_kaggle.sh"), str(lgm_root)], check=True)
+    print(f"MVDream will be fetched automatically from: {MVDREAM_MODEL_URL}")
 
 
 def main() -> None:

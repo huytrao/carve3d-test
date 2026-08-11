@@ -81,6 +81,8 @@ recorded in `metrics.json`.
 
 Checkpoint selection, alternatives considered, and reproduction limitations are
 documented in [docs/RESEARCH.md](docs/RESEARCH.md).
+Direct checkpoint links and download behavior (without committing binaries) are
+listed in [CHECKPOINT_DOWNLOADS.md](CHECKPOINT_DOWNLOADS.md).
 
 ## Release TODOs
 - [ ] training and testing text prompt dataset
