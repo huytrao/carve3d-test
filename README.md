@@ -9,6 +9,74 @@ This repository does not contain the implementation of the SDXL-based multiview 
 To implement the full Carve3D pipeline, an open-sourced sparse-view reconstruction model is needed, such as [OpenLRM](https://github.com/3DTopia/OpenLRM), [GRM](https://github.com/justimyhxu/grm), [LGM](https://github.com/3DTopia/LGM), etc. 
 Pull requests are welcome!
 
+## Runnable full pipeline (four images or a prompt)
+
+This fork adds an executable, reproducible replacement for the non-released
+components above.  It uses the official [LGM](https://github.com/3DTopia/LGM)
+multi-view Gaussian reconstructer and its public
+[`model_fp16_fixrot.safetensors`](https://huggingface.co/ashawkey/LGM/resolve/main/model_fp16_fixrot.safetensors)
+checkpoint.  It performs the entire evaluation path:
+
+```
+4 real views (0/90/180/270) ──> LGM Gaussian reconstruction ──> same-pose renders ──> LPIPS MRC
+prompt ──> MVDream public checkpoint ──> 4 views ──> LGM ──> same-pose renders ──> LPIPS MRC
+```
+
+The prompt route is an **open-checkpoint baseline**, using
+`ashawkey/mvdream-sd2.1-diffusers`; it is not a claim that the unpublished
+Carve3D/Instant3D diffusion checkpoint has been reproduced.  The four-image
+route is the direct reconstruction/MRC experiment and is the recommended way
+to evaluate real captures.
+
+### Kaggle quick start
+
+Open [full_pipeline_run_in_kaggle.ipynb](full_pipeline_run_in_kaggle.ipynb),
+turn on *Internet* and a GPU accelerator, then set `INPUT_DIR` to a Kaggle
+dataset containing exactly these four views:
+
+```
+view_000.png   # front, azimuth 0 degrees
+view_090.png   # right, azimuth 90 degrees
+view_180.png   # back, azimuth 180 degrees
+view_270.png   # left, azimuth 270 degrees
+```
+
+The notebook installs the CUDA rasterizer, pins LGM source to commit
+`fe8d12cff8c827df7bb77a3c8e8b37408cb6fe4c`, downloads the public checkpoint,
+and creates `reconstruction.ply`, render grids, an orbit video, and
+`metrics.json`.  LGM reports roughly 10 GB VRAM for its official inference
+stack; this direct-four-view adapter does not load ImageDream, but a 16 GB
+Kaggle GPU remains the practical target.
+
+### Local command
+
+```bash
+# First install LGM and the official checkpoint (requires CUDA, nvcc, and internet).
+bash scripts/setup_lgm_kaggle.sh ./LGM
+
+python full_pipeline/run.py \
+  --lgm-root ./LGM \
+  --input-dir /path/to/four_views \
+  --output-dir outputs/chair
+```
+
+For a public-checkpoint prompt baseline:
+
+```bash
+python full_pipeline/run.py \
+  --lgm-root ./LGM \
+  --prompt "a wooden chair" \
+  --output-dir outputs/chair_prompt
+```
+
+Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
+test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
+Lower MRC is better.  The precise source order and all checkpoint metadata are
+recorded in `metrics.json`.
+
+Checkpoint selection, alternatives considered, and reproduction limitations are
+documented in [docs/RESEARCH.md](docs/RESEARCH.md).
+
 ## Release TODOs
 - [ ] training and testing text prompt dataset
 - [x] SDXL LoRA training code adapted from [diffusers](https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_lora_sdxl.py) and [DDPO](https://github.com/kvablack/ddpo-pytorch)
