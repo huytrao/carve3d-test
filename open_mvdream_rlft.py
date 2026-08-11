@@ -543,6 +543,13 @@ def restore_lora(unet: Any, state: dict[str, Any]) -> None:
         parameters[name].data.copy_(value.to(device=parameters[name].device, dtype=parameters[name].dtype))
 
 
+def write_training_progress(destination: Path, **progress: Any) -> None:
+    """Persist a compact status record after each costly RL milestone."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+
+
 def evaluate_prompts(
     pipe: Any,
     prompts: Sequence[str],
@@ -620,7 +627,18 @@ def main() -> None:
     best_state = lora_state(pipe.unet)
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
     validations_without_improvement = 0
-    print(f"baseline validation MRC={best_validation_mrc:.6f}")
+    progress_file = args.output_dir / "training_progress.json"
+    write_training_progress(
+        progress_file,
+        status="running",
+        stage="baseline_validation_complete",
+        current_epoch=0,
+        total_epochs=args.epochs,
+        best_epoch=best_epoch,
+        best_validation_mrc=best_validation_mrc,
+        baseline_validation_mrc=baseline_validation["mean_mrc"],
+    )
+    print(f"[RL 0/{args.epochs}] baseline validation MRC={best_validation_mrc:.6f}", flush=True)
 
     for epoch in range(args.epochs):
         trajectories: list[Trajectory] = []
@@ -628,6 +646,11 @@ def main() -> None:
         # reward-normalized advantage a meaningful within-prompt comparison,
         # then cycles over the curated prompt list across epochs.
         epoch_prompt = prompts[epoch % len(prompts)]
+        print(
+            f"[RL {epoch + 1}/{args.epochs}] sampling {args.samples_per_epoch} trajectories "
+            f"for: {epoch_prompt}",
+            flush=True,
+        )
         for sample_index in range(args.samples_per_epoch):
             seed = args.seed + epoch * args.samples_per_epoch + sample_index
             trajectory = sample_trajectory(
@@ -642,10 +665,27 @@ def main() -> None:
             )
             score_and_save(trajectory, scorer, args.output_dir / "epochs" / f"epoch_{epoch:03d}" / f"sample_{sample_index:03d}")
             trajectories.append(trajectory)
-            print(f"epoch={epoch} sample={sample_index} MRC={trajectory.mrc:.6f} reward={trajectory.reward:.6f}")
+            print(
+                f"[RL {epoch + 1}/{args.epochs}] sample {sample_index + 1}/{args.samples_per_epoch} "
+                f"MRC={trajectory.mrc:.6f} reward={trajectory.reward:.6f}",
+                flush=True,
+            )
+            write_training_progress(
+                progress_file,
+                status="running",
+                stage="sampling",
+                current_epoch=epoch + 1,
+                total_epochs=args.epochs,
+                current_sample=sample_index + 1,
+                samples_per_epoch=args.samples_per_epoch,
+                last_mrc=trajectory.mrc,
+                best_epoch=best_epoch,
+                best_validation_mrc=best_validation_mrc,
+            )
 
         rewards = np.asarray([trajectory.reward for trajectory in trajectories], dtype=np.float32)
         advantages = ((rewards - rewards.mean()) / (rewards.std() + 1e-6)).tolist()
+        print(f"[RL {epoch + 1}/{args.epochs}] updating fp32 LoRA weights...", flush=True)
         update = replay_policy_gradient(
             pipe,
             trajectories,
@@ -665,7 +705,11 @@ def main() -> None:
             **update,
         }
         history.append(epoch_record)
-        print(json.dumps(epoch_record, indent=2))
+        print(
+            f"[RL {epoch + 1}/{args.epochs}] update complete: "
+            f"mean_MRC={epoch_record['mean_mrc']:.6f}, grad_norm={update['grad_norm']:.6f}",
+            flush=True,
+        )
         save_lora(pipe.unet, args.output_dir / "checkpoints" / f"lora_epoch_{epoch:03d}.pt")
 
         should_validate = (epoch + 1) % args.validation_every == 0 or epoch + 1 == args.epochs
@@ -685,16 +729,37 @@ def main() -> None:
                 best_epoch = epoch
                 best_state = save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
                 validations_without_improvement = 0
-                print(f"new best validation MRC={best_validation_mrc:.6f} at epoch={epoch}")
+                print(f"[RL {epoch + 1}/{args.epochs}] new best validation MRC={best_validation_mrc:.6f}", flush=True)
             else:
                 validations_without_improvement += 1
                 print(
-                    f"validation MRC={validation['mean_mrc']:.6f}; best={best_validation_mrc:.6f}; "
-                    f"no-improvement validations={validations_without_improvement}"
+                    f"[RL {epoch + 1}/{args.epochs}] validation MRC={validation['mean_mrc']:.6f}; "
+                    f"best={best_validation_mrc:.6f}; no-improvement={validations_without_improvement}",
+                    flush=True,
                 )
                 if validations_without_improvement >= args.early_stop_patience:
-                    print("Early stopping: validation MRC stopped improving.")
+                    print("[RL] early stopping: validation MRC stopped improving.", flush=True)
+                    write_training_progress(
+                        progress_file,
+                        status="early_stopped",
+                        stage="training_complete",
+                        current_epoch=epoch + 1,
+                        total_epochs=args.epochs,
+                        best_epoch=best_epoch,
+                        best_validation_mrc=best_validation_mrc,
+                    )
                     break
+        write_training_progress(
+            progress_file,
+            status="running",
+            stage="epoch_complete",
+            current_epoch=epoch + 1,
+            total_epochs=args.epochs,
+            mean_training_mrc=epoch_record["mean_mrc"],
+            validation_mrc=epoch_record.get("validation_mrc"),
+            best_epoch=best_epoch,
+            best_validation_mrc=best_validation_mrc,
+        )
 
     restore_lora(pipe.unet, best_state)
     pipe.unet.eval()
@@ -743,6 +808,16 @@ def main() -> None:
         },
     }
     (args.output_dir / "rlft_metrics.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    write_training_progress(
+        progress_file,
+        status="completed",
+        stage="final_evaluation_complete",
+        current_epoch=len(history),
+        total_epochs=args.epochs,
+        best_epoch=best_epoch,
+        best_validation_mrc=best_validation_mrc,
+        final_mrc=evaluation.mrc,
+    )
     print(f"\nCompleted open RLFT. Results: {args.output_dir.resolve()}")
 
 

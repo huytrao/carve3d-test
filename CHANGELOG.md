@@ -52,6 +52,8 @@ All material pipeline changes are recorded here.
 - Replace the one-update smoke defaults with a T4 x2 quality profile: 16
   updates, four same-prompt trajectories per update, 30 DDIM steps, held-out
   validation, best-LoRA restoration, and early stopping on validation MRC.
+- Add concise live `[RL epoch/total]` progress lines and a continuously updated
+  `training_progress.json` file for Kaggle monitoring.
 
 ## Earlier work — `implement_full_pipeline`
 
