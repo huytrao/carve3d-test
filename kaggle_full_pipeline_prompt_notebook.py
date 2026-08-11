@@ -49,8 +49,7 @@ def main() -> None:
 
     from kaggle_full_pipeline_prompt import main as pipeline_main
 
-    sys.argv = [
-        "kaggle_full_pipeline_prompt.py",
+    pipeline_main([
         "--lgm-root",
         LGM_ROOT,
         "--prompt",
@@ -59,8 +58,7 @@ def main() -> None:
         SEED,
         "--output-dir",
         OUTPUT_DIR,
-    ]
-    pipeline_main()
+    ])
 
 
 if __name__ == "__main__":

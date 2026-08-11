@@ -97,8 +97,7 @@ def main() -> None:
     arguments = build_pipeline_arguments()
     print("Running prompt:", arguments[arguments.index("--prompt") + 1])
     print("Writing results to:", arguments[arguments.index("--output-dir") + 1])
-    sys.argv = ["kaggle_full_pipeline_prompt.py", *arguments]
-    kaggle_prompt_main()
+    kaggle_prompt_main(arguments)
 
 
 if __name__ == "__main__":

@@ -72,8 +72,10 @@ def _bootstrap(repo_root: Path, lgm_root: Path, force: bool) -> None:
     print(f"MVDream will be fetched automatically from: {MVDREAM_MODEL_URL}")
 
 
-def main() -> None:
-    arguments = sys.argv[1:]
+def main(arguments: list[str] | None = None) -> None:
+    """Run the prompt pipeline from explicit args or normal CLI arguments."""
+
+    arguments = list(sys.argv[1:] if arguments is None else arguments)
     if "--help" in arguments or "-h" in arguments:
         print(__doc__)
         print("All remaining flags are documented by full_pipeline/run.py --help.")

@@ -88,6 +88,11 @@ To upload one Python file to Kaggle (or paste its entire contents into one Code
 cell), use `kaggle_full_pipeline_prompt_notebook.py`. Edit its `PROMPT` and
 `OUTPUT_DIR` constants, then run it.
 
+For the most direct Kaggle experience, upload
+`kaggle_full_pipeline_prompt.ipynb`: it contains the required Markdown and one
+Code cell that passes the prompt explicitly rather than relying on notebook
+`sys.argv`.
+
 Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
 test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
 Lower MRC is better.  The precise source order and all checkpoint metadata are
