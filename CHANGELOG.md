@@ -94,6 +94,26 @@ All material pipeline changes are recorded here.
   PyTorch weight decay (`1e-2`) was 100x the paper's reported `1e-4`.
 - Add a detailed v3 non-convergence diagnosis to `docs/OPEN_RLFT.md` and move
   the one-cell run to a fresh `carve3d-open-rlft-output-v4` directory.
+- Keep external four-image reconstruction as stage A, then continue into the
+  requested prompt-RL experiment by default. Its train/validation/final prompts
+  consistently describe the steel staircase shown by the source views; users
+  can still set `RUN_PROMPT_RLFT=False` for a direct-only run.
+- Remove hidden chair/teapot RLFT defaults. `open_mvdream_rlft.py` now requires
+  an explicit `--target-prompt` or `--prompt`, resolves validation/final prompts
+  from that same configuration, and fails before model loading if the prompt
+  setup is missing or inconsistent.
+- Add a paper-faithful Kaggle T4 x2 profile: general low-reward-style training
+  prompts with the steel staircase held out, rank-4 fp32 LoRA, batch-scaled
+  `3e-5` learning rate, persistent three-appearance reward/KL statistics, and
+  paper-style validation-KL early stopping. Per-update transactional rollback
+  is no longer used by the one-cell profile.
+- Add reduced paper Appendix-C.1 prompt curation: score eight candidates with
+  the base policy and train the four with highest MRC/lowest reward.
+- Pipeline GPU-0 MVDream sampling with GPU-1 LGM/MRC scoring through
+  `--overlap-reward`, increasing dual-T4 utilization without changing the
+  sampled trajectories or on-policy objective.
+- Document the exact paper/main-versus-public substitutions and convergence
+  criteria in `docs/PAPER_T4X2.md`.
 
 ## Earlier work — `implement_full_pipeline`
 

@@ -94,7 +94,7 @@ uses GPU 1 for LGM automatically when T4 x2 is enabled. LGM inference itself
 is one model on one GPU, so GPU 0 is intentionally left free rather than
 pretending that the reconstruction is distributed across both cards.
 
-The current `code.txt` additionally tries common capture elevations
+When `RUN_DIRECT_RECONSTRUCTION=True`, `code.txt` additionally tries common capture elevations
 (-10/-5/0/+5/+10 degrees) for the real four photos, keeps the lowest
 same-camera LPIPS MRC result, and records all candidate scores in
 `metrics.json`. This is a camera-alignment search, not a claim that MRC alone
@@ -102,8 +102,18 @@ is ground-truth 3D accuracy. It then safely searches global RGB, opacity, and
 scale calibration candidates using LGM's forward renderer only, retaining the
 lowest-MRC result and printing `[Appearance]` candidate metrics. This avoids
 the unstable CUDA backward kernel seen with current Kaggle T4 builds. Prompt
-LoRA RL is optional and does not modify the resulting four-photo
-reconstruction.
+The paper-style one-cell profile starts RLFT without repeating the unrelated
+direct-photo stage; set `RUN_DIRECT_RECONSTRUCTION=True` when a fresh PLY is
+also needed. Set `RUN_PROMPT_RLFT=False` for a direct-only run. RLFT remains a separate MVDream
+experiment and does not modify the resulting four-photo reconstruction; its
+training prompts form a small general-object curriculum, while the steel stair
+prompt is held out for validation/final evaluation.
+
+External images are fully supported by the direct route. They cannot replace
+MVDream samples inside policy-gradient RLFT: the update requires each sampled
+DDIM action and its policy log probability, which a standalone photograph does
+not contain. An image-reference loss could be added to a different fine-tuning
+method, but MVDream would still need to generate candidates during training.
 
 ### Local command
 
@@ -184,8 +194,9 @@ abstract functions, which is visible in this repository's `rewards.py` and
 `config/dgx.py`. Consequently, no command can truthfully recreate the reported
 Carve3DM weights from this source alone.
 
-For an executable public-model approximation, [code.txt](code.txt) now runs
-the direct four-capture evaluation, then a real on-policy LoRA RLFT cycle:
+For an executable public-model approximation, [code.txt](code.txt) runs an
+on-policy LoRA RLFT cycle. Direct four-capture evaluation is an independent
+optional stage controlled by `RUN_DIRECT_RECONSTRUCTION`:
 
 ```
 public MVDream -> 4 generated views -> public LGM -> bbox LPIPS MRC reward
@@ -193,11 +204,16 @@ public MVDream -> 4 generated views -> public LGM -> bbox LPIPS MRC reward
                 -> one on-policy score-function LoRA update -> post-RL MRC
 ```
 
-It assigns MVDream/RL to GPU 0 and LGM/MRC to GPU 1 on Kaggle T4 x2. The
-one-cell quality profile uses eight small updates and remains vastly below the
-paper's batch-768, 55-epoch training on 48 A100 80GB GPUs. Read
-[docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) for the v3 non-convergence diagnosis,
-v4 safeguards, and limits before comparing results to the paper.
+When enabled, it assigns MVDream/RL to GPU 0 and LGM/MRC to GPU 1 on Kaggle T4
+x2. RLFT now requires an explicit `--target-prompt` or `--prompt`; it never
+silently substitutes chair/teapot demo categories. The one-cell quality
+profile uses at most 12 small updates, persistent three-appearance per-prompt
+statistics, base-policy low-reward prompt curation, paper-style KL early
+stopping, and overlapped work across both T4s.
+It remains vastly below the paper's batch-768, 55-epoch training on 48 A100
+80GB GPUs. Read [docs/PAPER_T4X2.md](docs/PAPER_T4X2.md) for the exact
+paper-to-public mapping and [docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) for the
+earlier non-convergence diagnosis.
 
 ## Release TODOs
 - [ ] training and testing text prompt dataset

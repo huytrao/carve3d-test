@@ -24,7 +24,9 @@ import json
 import os
 import shutil
 import sys
-from contextlib import contextmanager
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -71,10 +73,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lgm-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("/kaggle/working/open-rlft-output"))
     parser.add_argument(
+        "--target-prompt",
+        help=(
+            "Primary object prompt for a target-specific RLFT experiment. It is used as the validation/final "
+            "fallback, but it does not turn real input photographs into RL trajectories."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         action="append",
         dest="prompts",
-        help="One training prompt. Repeat --prompt for more. Defaults to two conservative object prompts.",
+        help=(
+            "One training prompt. Repeat for multiple prompt groups. At least --target-prompt or --prompt is "
+            "required; there are intentionally no hidden chair/teapot defaults."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=16, help="On-policy RL updates.")
     parser.add_argument("--samples-per-epoch", type=int, default=4, help="Same-prompt trajectories per update; at least 2 are required for advantages.")
@@ -83,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Distinct prompts in each update; samples-per-epoch must divide evenly and leave at least 2 samples per prompt.",
+    )
+    parser.add_argument(
+        "--curate-prompt-count",
+        type=int,
+        default=0,
+        help=(
+            "Before RL, score every explicit training prompt once with the base policy and retain this many "
+            "highest-MRC prompts. Zero disables the paper-style low-reward prompt curation."
+        ),
     )
     parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
@@ -118,13 +139,33 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Clamp the combined reward/KL advantage, matching the released Carve3D trainer default.",
     )
+    parser.add_argument(
+        "--stat-buffer-epochs",
+        type=int,
+        default=3,
+        help=(
+            "Number of per-prompt sample windows retained when normalizing reward and base-KL advantages. "
+            "The paper uses an approximately three-epoch window."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--elevation", type=float, default=0.0)
     parser.add_argument("--diffusion-device", type=int, default=0)
     parser.add_argument("--lgm-device", type=int, default=1)
     parser.add_argument("--render-size", type=int, default=256)
     parser.add_argument("--mrc-metric", choices=("lpips", "l1"), default="lpips")
-    parser.add_argument("--final-prompt", default="a wooden chair, isolated studio product photograph, white background")
+    parser.add_argument(
+        "--overlap-reward",
+        action="store_true",
+        help=(
+            "Pipeline GPU-0 MVDream sampling with GPU-1 LGM/MRC scoring. This reduces T4 x2 wall time "
+            "without changing trajectories, rewards, or the on-policy update."
+        ),
+    )
+    parser.add_argument(
+        "--final-prompt",
+        help="Prompt used for post-RL candidates. Defaults to --target-prompt, then the first training prompt.",
+    )
     parser.add_argument(
         "--validation-prompt",
         action="append",
@@ -144,7 +185,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Validate every update and restore the pre-update LoRA/optimizer state whenever validation MRC does not improve. "
-            "Recommended for T4's small, noisy RL batches."
+            "This conservative diagnostic mode is not the paper algorithm; leave it disabled for paper-style on-policy training."
+        ),
+    )
+    parser.add_argument(
+        "--kl-early-stop-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Stop and restore the best safe checkpoint when fixed-seed validation KL to the base policy reaches this value. "
+            "The paper reports 3.2e-4 for Instant3D; that absolute value is architecture-dependent for MVDream."
         ),
     )
     parser.add_argument(
@@ -156,18 +206,64 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def default_prompts() -> list[str]:
-    return [
-        "a wooden chair, isolated studio product photograph, white background",
-        "a ceramic teapot, isolated studio product photograph, white background",
-    ]
+@dataclass(frozen=True)
+class PromptConfiguration:
+    """Resolved prompts with no unrelated implicit object categories."""
+
+    training: list[str]
+    validation: list[str]
+    final: str
+    target: str | None
 
 
-def default_validation_prompts() -> list[str]:
-    return [
-        "a green desk fan, isolated studio product photograph, white background",
-        "a canvas hiking backpack, isolated studio product photograph, white background",
-    ]
+def _nonempty_prompts(values: Sequence[str] | None, option: str) -> list[str]:
+    prompts = [value.strip() for value in values or []]
+    if any(not prompt for prompt in prompts):
+        raise ValueError(f"{option} cannot be empty")
+    return prompts
+
+
+def resolve_prompt_configuration(args: argparse.Namespace) -> PromptConfiguration:
+    """Resolve train/validation/final prompts without silently changing object class.
+
+    A real four-view folder belongs to ``kaggle_import_four_views.py``. RLFT
+    trains a text-conditioned MVDream policy and therefore still needs a text
+    target plus model-sampled DDIM trajectories.
+    """
+
+    target_values = _nonempty_prompts([args.target_prompt] if args.target_prompt is not None else [], "--target-prompt")
+    target = target_values[0] if target_values else None
+    training = _nonempty_prompts(args.prompts, "--prompt")
+    validation = _nonempty_prompts(args.validation_prompts, "--validation-prompt")
+    final_values = _nonempty_prompts([args.final_prompt] if args.final_prompt is not None else [], "--final-prompt")
+
+    if not training:
+        if target is None:
+            raise ValueError(
+                "RLFT needs an explicit object description. Supply --target-prompt or at least one --prompt. "
+                "For four external images, run kaggle_import_four_views.py instead."
+            )
+        training = [target]
+    if not validation:
+        # A target-specific run validates the actual requested category at
+        # fixed held-out seeds. A multi-category run without a separate
+        # validation list reuses its explicit categories rather than silently
+        # substituting unrelated demo nouns.
+        validation = [target] if target is not None else list(training)
+    final = final_values[0] if final_values else (target or training[0])
+
+    unique_training = list(dict.fromkeys(training))
+    if len(unique_training) < args.prompts_per_update:
+        raise ValueError(
+            f"--prompts-per-update={args.prompts_per_update} needs at least that many distinct --prompt values; "
+            f"received {len(unique_training)}. Use --prompts-per-update 1 for one target prompt."
+        )
+    return PromptConfiguration(
+        training=training,
+        validation=validation,
+        final=final,
+        target=target,
+    )
 
 
 class LoRALinear:  # Wrapped lazily so importing --help does not require PyTorch.
@@ -538,6 +634,9 @@ class LgmMrcScorer:
         import torch.nn.functional as functional
         from full_pipeline.run import _render_views
 
+        # CUDA's current device is thread-local. This matters when Kaggle T4x2
+        # overlaps this GPU-1 reward call with MVDream sampling on GPU 0.
+        self.torch.cuda.set_device(self.device)
         prepared_images = self._prepare_lgm_views(ordered_images)
         inputs = self._prepared_tensor(prepared_images)
         normalized = inputs.clone()
@@ -605,6 +704,53 @@ def grouped_normalized_advantages(
         for index, value in zip(indexes, normalized):
             result[index] = value
     return result.tolist()
+
+
+class PerPromptRunningNormalizer:
+    """Paper/DDPO per-prompt statistics retained across on-policy updates."""
+
+    def __init__(self, buffer_size: int, min_count: int, epsilon: float = 1e-6) -> None:
+        if buffer_size < 1 or min_count < 1:
+            raise ValueError("buffer_size and min_count must be positive")
+        if min_count > buffer_size:
+            raise ValueError("min_count cannot exceed buffer_size")
+        self.buffer_size = buffer_size
+        self.min_count = min_count
+        self.epsilon = epsilon
+        self.stats: dict[str, deque[float]] = {}
+
+    def update(self, values: Sequence[float], group_ids: Sequence[str]) -> list[float]:
+        """Append the current batch, then normalize from each prompt's running window."""
+
+        if len(values) != len(group_ids):
+            raise ValueError("values and group_ids must have the same length")
+        values_array = np.asarray(values, dtype=np.float32)
+        result = np.empty(len(values_array), dtype=np.float32)
+        for group_id in dict.fromkeys(group_ids):
+            indexes = [index for index, candidate in enumerate(group_ids) if candidate == group_id]
+            current = values_array[indexes]
+            history = self.stats.setdefault(group_id, deque(maxlen=self.buffer_size))
+            history.extend(float(value) for value in current)
+            if len(history) < self.min_count:
+                mean = float(values_array.mean())
+                standard_deviation = float(values_array.std())
+            else:
+                history_array = np.asarray(history, dtype=np.float32)
+                mean = float(history_array.mean())
+                standard_deviation = float(history_array.std())
+            denominator = standard_deviation + self.epsilon
+            result[indexes] = (current - mean) / denominator
+        return result.tolist()
+
+    def summary(self) -> dict[str, dict[str, float | int]]:
+        return {
+            group_id: {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "count": len(values),
+            }
+            for group_id, values in self.stats.items()
+        }
 
 
 def replay_policy_gradient(
@@ -750,9 +896,17 @@ def evaluate_prompts(
             args.elevation,
         )
         score_and_save(trajectory, scorer, destination / f"prompt_{index:02d}")
-        records.append({"prompt": prompt, "seed": trajectory.seed, "mrc": trajectory.mrc})
+        records.append(
+            {
+                "prompt": prompt,
+                "seed": trajectory.seed,
+                "mrc": trajectory.mrc,
+                "kl_to_base": trajectory.kl_to_base,
+            }
+        )
     mean_mrc = float(np.mean([record["mrc"] for record in records]))
-    result = {"mean_mrc": mean_mrc, "records": records}
+    mean_kl_to_base = float(np.mean([record["kl_to_base"] for record in records]))
+    result = {"mean_mrc": mean_mrc, "mean_kl_to_base": mean_kl_to_base, "records": records}
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if was_training:
@@ -826,6 +980,8 @@ def main() -> None:
         raise ValueError("--samples-per-epoch must be at least 2 so RL can compute a reward advantage")
     if args.prompts_per_update < 1:
         raise ValueError("--prompts-per-update must be at least 1")
+    if args.curate_prompt_count < 0:
+        raise ValueError("--curate-prompt-count cannot be negative")
     if args.samples_per_epoch % args.prompts_per_update != 0:
         raise ValueError("--samples-per-epoch must divide evenly by --prompts-per-update")
     samples_per_prompt = args.samples_per_epoch // args.prompts_per_update
@@ -839,12 +995,23 @@ def main() -> None:
         raise ValueError("--min-validation-improvement cannot be negative")
     if args.advantage_clip <= 0:
         raise ValueError("--advantage-clip must be positive")
+    if args.stat_buffer_epochs < 1:
+        raise ValueError("--stat-buffer-epochs must be at least 1")
+    if args.kl_early_stop_threshold is not None and args.kl_early_stop_threshold <= 0:
+        raise ValueError("--kl-early-stop-threshold must be positive")
     if args.final_candidates < 1:
         raise ValueError("--final-candidates must be at least 1")
-    prompts = args.prompts or default_prompts()
-    validation_prompts = args.validation_prompts or default_validation_prompts()
-    if not prompts:
-        raise ValueError("Supply at least one --prompt")
+    prompt_configuration = resolve_prompt_configuration(args)
+    prompts = prompt_configuration.training
+    validation_prompts = prompt_configuration.validation
+    # Downstream final-candidate helpers consume the resolved value from args.
+    args.final_prompt = prompt_configuration.final
+    print("Resolved RLFT prompts (these condition MVDream; they are not captions read from input images):")
+    for index, prompt in enumerate(prompts, start=1):
+        print(f"  train {index}: {prompt}")
+    for index, prompt in enumerate(validation_prompts, start=1):
+        print(f"  validation {index}: {prompt}")
+    print(f"  final: {args.final_prompt}", flush=True)
 
     diffusion_device, _ = _check_devices(args.diffusion_device, args.lgm_device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -864,6 +1031,42 @@ def main() -> None:
         weight_decay=1e-4,
     )
     scorer = LgmMrcScorer(args.lgm_root, args.lgm_device, args.render_size, args.mrc_metric, args.elevation)
+    curation: dict[str, Any] = {"enabled": False, "candidates": list(prompts), "selected": list(prompts)}
+    if args.curate_prompt_count:
+        curation_candidates = list(dict.fromkeys(prompts))
+        if args.curate_prompt_count < args.prompts_per_update:
+            raise ValueError("--curate-prompt-count must be at least --prompts-per-update")
+        if args.curate_prompt_count > len(curation_candidates):
+            raise ValueError("--curate-prompt-count cannot exceed the number of distinct training prompts")
+        print(
+            f"[Curation] scoring {len(curation_candidates)} base-policy prompts; selecting "
+            f"{args.curate_prompt_count} with highest MRC...",
+            flush=True,
+        )
+        curation_evaluation = evaluate_prompts(
+            pipe,
+            curation_candidates,
+            scorer,
+            args.output_dir / "curation" / "base_policy",
+            args.seed + 2_000_000,
+            diffusion_device,
+            args,
+        )
+        ranked = sorted(curation_evaluation["records"], key=lambda record: record["mrc"], reverse=True)
+        prompts = [record["prompt"] for record in ranked[: args.curate_prompt_count]]
+        curation = {
+            "enabled": True,
+            "criterion": "highest base-policy MRC (lowest reward)",
+            "samples_per_candidate": 1,
+            "candidates": curation_evaluation["records"],
+            "selected": list(prompts),
+        }
+        for index, record in enumerate(ranked, start=1):
+            marker = "selected" if record["prompt"] in prompts else "not selected"
+            print(f"[Curation] rank {index}: MRC={record['mrc']:.6f} ({marker}) {record['prompt']}", flush=True)
+    stat_buffer_size = samples_per_prompt * args.stat_buffer_epochs
+    reward_stat_tracker = PerPromptRunningNormalizer(stat_buffer_size, samples_per_prompt)
+    kl_stat_tracker = PerPromptRunningNormalizer(stat_buffer_size, samples_per_prompt)
     history: list[dict[str, Any]] = []
     validation_seed = args.seed + 1_000_000
     baseline_validation = evaluate_prompts(
@@ -880,6 +1083,7 @@ def main() -> None:
     best_state = lora_state(pipe.unet)
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
     validations_without_improvement = 0
+    training_stop_reason = "max_epochs"
     progress_file = args.output_dir / "training_progress.json"
     write_training_progress(
         progress_file,
@@ -891,7 +1095,11 @@ def main() -> None:
         best_validation_mrc=best_validation_mrc,
         baseline_validation_mrc=baseline_validation["mean_mrc"],
     )
-    print(f"[RL 0/{args.epochs}] baseline validation MRC={best_validation_mrc:.6f}", flush=True)
+    print(
+        f"[RL 0/{args.epochs}] baseline validation MRC={best_validation_mrc:.6f} "
+        f"KL_base={baseline_validation['mean_kl_to_base']:.6f}",
+        flush=True,
+    )
 
     for epoch in range(args.epochs):
         # In transactional mode the validation score is a hard trust-region
@@ -913,55 +1121,78 @@ def main() -> None:
             f"across {args.prompts_per_update} prompt(s)",
             flush=True,
         )
-        for prompt_index, epoch_prompt in enumerate(epoch_prompts):
+        executor_context = ThreadPoolExecutor(max_workers=1) if args.overlap_reward else nullcontext(None)
+        pending_scores: list[tuple[int, Trajectory, Future[Any]]] = []
+
+        def finish_score(sample_index: int, trajectory: Trajectory, future: Future[Any] | None = None) -> None:
+            if future is not None:
+                future.result()
+            trajectories.append(trajectory)
+            completed = len(trajectories)
             print(
-                f"[RL {epoch + 1}/{args.epochs}] prompt {prompt_index + 1}/{args.prompts_per_update}: "
-                f"{epoch_prompt}",
+                f"[RL {epoch + 1}/{args.epochs}] sample {completed}/{args.samples_per_epoch} "
+                f"MRC={trajectory.mrc:.6f} KL_base={trajectory.kl_to_base:.6f}",
                 flush=True,
             )
-            for prompt_sample_index in range(samples_per_prompt):
-                sample_index = prompt_index * samples_per_prompt + prompt_sample_index
-                seed = args.seed + epoch * args.samples_per_epoch + sample_index
-                trajectory = sample_trajectory(
-                    pipe,
-                    epoch_prompt,
-                    seed,
-                    diffusion_device,
-                    args.num_steps,
-                    args.guidance_scale,
-                    args.eta,
-                    args.elevation,
-                )
-                score_and_save(
-                    trajectory,
-                    scorer,
-                    args.output_dir / "epochs" / f"epoch_{epoch:03d}" / f"sample_{sample_index:03d}",
-                )
-                trajectories.append(trajectory)
+            write_training_progress(
+                progress_file,
+                status="running",
+                stage="sampling_and_reward",
+                current_epoch=epoch + 1,
+                total_epochs=args.epochs,
+                current_sample=completed,
+                samples_per_epoch=args.samples_per_epoch,
+                last_sample_index=sample_index,
+                last_mrc=trajectory.mrc,
+                last_kl_to_base=trajectory.kl_to_base,
+                best_epoch=best_epoch,
+                best_validation_mrc=best_validation_mrc,
+            )
+
+        with executor_context as reward_executor:
+            for prompt_index, epoch_prompt in enumerate(epoch_prompts):
                 print(
-                    f"[RL {epoch + 1}/{args.epochs}] sample {sample_index + 1}/{args.samples_per_epoch} "
-                    f"MRC={trajectory.mrc:.6f} KL_base={trajectory.kl_to_base:.6f}",
+                    f"[RL {epoch + 1}/{args.epochs}] prompt {prompt_index + 1}/{args.prompts_per_update}: "
+                    f"{epoch_prompt}",
                     flush=True,
                 )
-                write_training_progress(
-                    progress_file,
-                    status="running",
-                    stage="sampling",
-                    current_epoch=epoch + 1,
-                    total_epochs=args.epochs,
-                    current_sample=sample_index + 1,
-                    samples_per_epoch=args.samples_per_epoch,
-                    last_mrc=trajectory.mrc,
-                    last_kl_to_base=trajectory.kl_to_base,
-                    best_epoch=best_epoch,
-                    best_validation_mrc=best_validation_mrc,
-                )
+                for prompt_sample_index in range(samples_per_prompt):
+                    sample_index = prompt_index * samples_per_prompt + prompt_sample_index
+                    seed = args.seed + epoch * args.samples_per_epoch + sample_index
+                    trajectory = sample_trajectory(
+                        pipe,
+                        epoch_prompt,
+                        seed,
+                        diffusion_device,
+                        args.num_steps,
+                        args.guidance_scale,
+                        args.eta,
+                        args.elevation,
+                    )
+                    destination = (
+                        args.output_dir / "epochs" / f"epoch_{epoch:03d}" / f"sample_{sample_index:03d}"
+                    )
+                    if reward_executor is None:
+                        score_and_save(trajectory, scorer, destination)
+                        finish_score(sample_index, trajectory)
+                    else:
+                        future = reward_executor.submit(score_and_save, trajectory, scorer, destination)
+                        pending_scores.append((sample_index, trajectory, future))
+                        # Keep at most one score queued behind the active GPU-1
+                        # job while GPU 0 samples the next trajectory.
+                        if len(pending_scores) > 1:
+                            finish_score(*pending_scores.pop(0))
+            while pending_scores:
+                finish_score(*pending_scores.pop(0))
 
         rewards = np.asarray([trajectory.reward for trajectory in trajectories], dtype=np.float32)
         kl_values = np.asarray([trajectory.kl_to_base for trajectory in trajectories], dtype=np.float32)
         group_ids = [trajectory.prompt for trajectory in trajectories]
-        reward_advantages = grouped_normalized_advantages(rewards.tolist(), group_ids)
-        kl_advantages = grouped_normalized_advantages(kl_values.tolist(), group_ids)
+        # Paper Eqs. (6), (9), and Appendix C.2: normalize reward and base-KL
+        # separately per prompt using a running window of roughly three prompt
+        # appearances, instead of discarding history after every tiny T4 batch.
+        reward_advantages = reward_stat_tracker.update(rewards.tolist(), group_ids)
+        kl_advantages = kl_stat_tracker.update(kl_values.tolist(), group_ids)
         unclipped_advantages = [
             args.reward_coeff * reward_advantage - args.kl_coeff * kl_advantage
             for reward_advantage, kl_advantage in zip(reward_advantages, kl_advantages)
@@ -994,6 +1225,7 @@ def main() -> None:
             "unclipped_combined_advantages": unclipped_advantages,
             "combined_advantages": advantages,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "stat_buffer_size_per_prompt": stat_buffer_size,
             **update,
         }
         history.append(epoch_record)
@@ -1019,6 +1251,33 @@ def main() -> None:
                 args,
             )
             epoch_record["validation_mrc"] = validation["mean_mrc"]
+            epoch_record["validation_kl_to_base"] = validation["mean_kl_to_base"]
+            kl_limit_reached = (
+                args.kl_early_stop_threshold is not None
+                and validation["mean_kl_to_base"] >= args.kl_early_stop_threshold
+            )
+            if kl_limit_reached:
+                training_stop_reason = "validation_kl_threshold"
+                epoch_record["update_accepted"] = False
+                epoch_record["early_stop_reason"] = "validation_kl_threshold"
+                print(
+                    f"[RL] paper-style KL early stopping: validation KL_base="
+                    f"{validation['mean_kl_to_base']:.6f} reached threshold="
+                    f"{args.kl_early_stop_threshold:.6f}. Restoring best safe LoRA.",
+                    flush=True,
+                )
+                write_training_progress(
+                    progress_file,
+                    status="early_stopped",
+                    stage="training_complete",
+                    reason="validation_kl_threshold",
+                    current_epoch=epoch + 1,
+                    total_epochs=args.epochs,
+                    best_epoch=best_epoch,
+                    best_validation_mrc=best_validation_mrc,
+                    validation_kl_to_base=validation["mean_kl_to_base"],
+                )
+                break
             validation_improvement = best_validation_mrc - validation["mean_mrc"]
             epoch_record["validation_improvement"] = validation_improvement
             improved = validation_improvement >= args.min_validation_improvement
@@ -1054,6 +1313,7 @@ def main() -> None:
                     flush=True,
                 )
                 if validations_without_improvement >= args.early_stop_patience:
+                    training_stop_reason = "validation_mrc_plateau"
                     print("[RL] early stopping: validation MRC stopped improving.", flush=True)
                     write_training_progress(
                         progress_file,
@@ -1101,23 +1361,40 @@ def main() -> None:
             "epochs": args.epochs,
             "samples_per_epoch": args.samples_per_epoch,
             "prompts_per_update": args.prompts_per_update,
+            "prompt_curation": curation,
             "ddim_steps": args.num_steps,
             "eta": args.eta,
             "timestep_loss_reduction": args.timestep_loss_reduction,
             "advantage_clip": args.advantage_clip,
+            "per_prompt_stat_tracking": {
+                "buffer_epochs": args.stat_buffer_epochs,
+                "buffer_size": stat_buffer_size,
+                "min_count": samples_per_prompt,
+                "reward": reward_stat_tracker.summary(),
+                "kl_to_base": kl_stat_tracker.summary(),
+            },
             "validation_every": args.validation_every,
             "early_stop_patience": args.early_stop_patience,
+            "kl_early_stop_threshold": args.kl_early_stop_threshold,
             "min_validation_improvement": args.min_validation_improvement,
             "learning_rate": args.learning_rate,
             "adamw": {"betas": [0.9, 0.999], "epsilon": 1e-8, "weight_decay": 1e-4},
             "transactional_validation": args.transactional_validation,
         },
         "devices": {"mvdream_rl": args.diffusion_device, "lgm_mrc": args.lgm_device},
+        "overlap_reward": args.overlap_reward,
         "mrc_metric": args.mrc_metric,
         "lora_projection_count": lora_projection_count,
+        "prompts": {
+            "target": prompt_configuration.target,
+            "training": prompts,
+            "validation": validation_prompts,
+            "final": args.final_prompt,
+        },
         "baseline_validation": baseline_validation,
         "best_validation_mrc": best_validation_mrc,
         "best_epoch": best_epoch,
+        "training_stop_reason": training_stop_reason,
         "history": history,
         "final_evaluation": final_selection,
     }
@@ -1131,6 +1408,7 @@ def main() -> None:
         best_epoch=best_epoch,
         best_validation_mrc=best_validation_mrc,
         final_mrc=final_selection["selected"]["mrc"],
+        training_stop_reason=training_stop_reason,
     )
     print(f"\nCompleted open RLFT. Results: {args.output_dir.resolve()}")
 

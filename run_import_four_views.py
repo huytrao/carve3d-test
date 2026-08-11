@@ -17,21 +17,20 @@ from pathlib import Path
 from kaggle_import_four_views import main
 
 
-INPUT_DIR = os.environ.get(
-    "CARVE3D_INPUT_DIR", "/kaggle/input/datasets/traoanhuy/carve3d/views"
-)
+INPUT_DIR = os.environ.get("CARVE3D_INPUT_DIR")
 OUTPUT_DIR = os.environ.get("CARVE3D_OUTPUT_DIR", "/kaggle/working/carve3d-four-view-output")
 LGM_ROOT = os.environ.get("LGM_ROOT", "/kaggle/working/LGM")
 
 
 if __name__ == "__main__":
-    main(
-        [
-            "--input-dir",
-            str(Path(INPUT_DIR)),
-            "--output-dir",
-            str(Path(OUTPUT_DIR)),
-            "--lgm-root",
-            str(Path(LGM_ROOT)),
-        ]
-    )
+    arguments = [
+        "--output-dir",
+        str(Path(OUTPUT_DIR)),
+        "--lgm-root",
+        str(Path(LGM_ROOT)),
+    ]
+    # Omitting --input-dir lets the Kaggle launcher try both the historical
+    # owner-qualified path and Kaggle's standard /kaggle/input/<slug> mount.
+    if INPUT_DIR is not None:
+        arguments.extend(("--input-dir", str(Path(INPUT_DIR))))
+    main(arguments)

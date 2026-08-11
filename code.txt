@@ -2,8 +2,8 @@
 # Kaggle settings: Internet ON, GPU accelerator = T4 x2.
 #
 # Full executable open workflow:
-#   A. 4 real input photos -> LGM -> camera/appearance search -> MRC
-#   B. optional research-only prompt -> MVDream -> LGM MRC reward -> LoRA RLFT
+#   A. optional 4-real-photo reconstruction/evaluation
+#   B. paper-style prompt RLFT with public MVDream + LGM
 #
 # This cannot be an exact Carve3D/Instant3D reproduction: their Instant3D
 # checkpoint and sparse-view LRM are not released. The repository records this
@@ -25,51 +25,69 @@ LGM_ROOT = WORKDIR / "LGM"
 
 # Your real, captured four views. Accepted names include view_000.png and
 # view_0.png; all four orientations (0, 90, 180, 270) are required.
-INPUT_DIR = Path("/kaggle/input/datasets/traoanhuy/carve3d/views")
+INPUT_DIR = Path(os.environ.get("CARVE3D_INPUT_DIR", "/kaggle/input/datasets/traoanhuy/carve3d/views"))
+INPUT_DIR_FALLBACKS = (Path("/kaggle/input/carve3d/views"),)
 DIRECT_OUTPUT_DIR = WORKDIR / "carve3d-direct-four-view-calibrated-output"
-RLFT_OUTPUT_DIR = WORKDIR / "carve3d-open-rlft-output-v4"
+RLFT_OUTPUT_DIR = WORKDIR / "carve3d-paper-faithful-t4x2-output-v6"
 
 # This is the safe path for YOUR four photographs. It starts from LGM's
 # Gaussian prediction, then tests forward-only global colour/opacity/scale
 # calibration candidates. It never invokes the unstable CUDA backward kernel.
 DIRECT_APPEARANCE_SEARCH = True
+RUN_DIRECT_RECONSTRUCTION = False  # Enable only when a fresh direct PLY is also needed.
 
-# This runs actual LoRA RLFT after direct reconstruction. It trains the public
-# MVDream prompt model (GPU 0) with LGM/MRC reward (GPU 1); it is a separate
-# paper-style experiment and does not modify the direct four-photo PLY above.
+# True runs the requested RLFT experiment after optional direct reconstruction.
+# It trains MVDream for general multi-view consistency and evaluates a held-out
+# stair prompt; it does not modify
+# the direct four-photo PLY because policy-gradient training needs images sampled
+# by MVDream together with their DDIM log probabilities. GPU 0 holds MVDream and
+# GPU 1 holds LGM/MRC.
 RUN_PROMPT_RLFT = True
 
-# Stabilized quality profile for T4 x2. Each update mixes two prompts with four
-# trajectories each and normalizes reward/KL inside each prompt group. Exact
-# frozen-base KL, fp32 DDIM log probabilities, and transactional validation
-# prevent the near-zero KL and gradient spikes seen in the older v3 run.
-RL_EPOCHS = 8
+# Paper-faithful T4 x2 profile. It preserves pure on-policy REINFORCE, rank-4
+# fp32 LoRA, reward/KL per-prompt normalization, AdamW, and KL early stopping.
+# Instant3D used batch 768 and lr=3e-4. With batch 8, square-root batch scaling
+# gives about 3e-5: substantially faster than the old 1e-5 profile without
+# pretending two T4s can reproduce 48 A100s.
+RL_EPOCHS = 12
 RL_SAMPLES_PER_EPOCH = 8
 RL_PROMPTS_PER_UPDATE = 2
+RL_CURATE_PROMPT_COUNT = 4
 RL_DDIM_STEPS = 30  # Official public MVDream/LGM text pipeline setting.
-RL_GUIDANCE_SCALE = 7.5
-RL_LEARNING_RATE = 1e-5
+RL_GUIDANCE_SCALE = 5.0  # Matches the paper; also supported by public MVDream.
+RL_LEARNING_RATE = 3e-5
 RL_REWARD_COEFF = 1.0
 RL_KL_COEFF = 0.2
 RL_TIMESTEP_REDUCTION = "mean"
 RL_ADVANTAGE_CLIP = 5.0
-RL_MIN_VALIDATION_IMPROVEMENT = 1e-4
+RL_STAT_BUFFER_EPOCHS = 3
+RL_KL_EARLY_STOP_THRESHOLD = 3.2e-4  # Paper value; logged explicitly because model scale differs.
+RL_MIN_VALIDATION_IMPROVEMENT = 0.0
 RL_MRC_METRIC = "lpips"  # Paper metric. Use "l1" only when LPIPS download is blocked.
 RL_EARLY_STOP_PATIENCE = 4
-FINAL_CANDIDATES = 8
+FINAL_CANDIDATES = 4
+
+# Paper training uses a curated set of low-reward, complex-but-not-too-creative
+# prompts and evaluates held-out prompts. The released main branch leaves that
+# dataset as TODO, so this public profile supplies an explicit small curriculum.
+# The staircase is held out for final evaluation; it is not a training prompt.
+FINAL_EVAL_PROMPT = (
+    "a freestanding gray steel five-step industrial staircase, black anti-slip rectangular treads, "
+    "triangular cross-braced frame, isolated studio product photograph, white background"
+)
 TRAIN_PROMPTS = [
-    "a wooden chair, isolated studio product photograph, white background",
-    "a ceramic teapot, isolated studio product photograph, white background",
-    "a leather travel suitcase, isolated studio product photograph, white background",
-    "a brass desk clock, isolated studio product photograph, white background",
-    "a small red toy car, isolated studio product photograph, white background",
-    "a blue glass perfume bottle, isolated studio product photograph, white background",
-    "a vintage film camera, isolated studio product photograph, white background",
-    "a woven picnic basket, isolated studio product photograph, white background",
+    "a vintage sewing machine with a large hand wheel and metal foot pedal, isolated studio product photo, white background",
+    "a compact red construction crane toy with a lattice boom and four wheels, isolated on white",
+    "an ornate brass table lamp with a pleated fabric shade and curved support arm, studio product photograph",
+    "a blue camping stove with two burners, control knobs and folding wind guards, isolated on white",
+    "a wooden rocking horse with curved runners, leather saddle and carved handles, studio product photograph",
+    "a small green garden cart with two wheels, metal frame and wooden handle, isolated white background",
+    "a retro film projector with twin reels, lens barrel and folding support feet, product photo on white",
+    "a ceramic countertop mixer with a stainless bowl and raised mixing head, isolated studio photograph",
 ]
 VALIDATION_PROMPTS = [
-    "a green desk fan, isolated studio product photograph, white background",
-    "a canvas hiking backpack, isolated studio product photograph, white background",
+    FINAL_EVAL_PROMPT,
+    "a folding metal workshop ladder with wide black treads and diagonal braces, isolated studio product photograph",
 ]
 
 # Public model downloads and package setup stay quiet; actual metrics/errors are
@@ -79,6 +97,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DIFFUSERS_VERBOSITY"] = "error"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 if not REPO.is_dir():
     subprocess.run(
@@ -98,58 +117,100 @@ else:
         check=True,
     )
 
-# Preview exactly the four source photos before loading LGM or starting direct
-# calibration. This catches reversed/misnamed camera views early.
-def resolve_view(angle: int) -> Path:
-    aliases = {f"view_{angle:03d}", f"view{angle:03d}", f"view_{angle}", f"view{angle}", str(angle)}
-    matches = sorted(
-        path for path in INPUT_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        and path.stem.lower() in aliases
+# Fail before the expensive direct reconstruction if Kaggle fetched an older
+# branch that does not yet contain this paper/T4 runner implementation.
+if RUN_PROMPT_RLFT:
+    rlft_help = subprocess.run(
+        [sys.executable, str(REPO / "open_mvdream_rlft.py"), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    required_options = (
+        "--overlap-reward",
+        "--stat-buffer-epochs",
+        "--kl-early-stop-threshold",
+        "--curate-prompt-count",
     )
-    if len(matches) != 1:
-        raise FileNotFoundError(f"Need exactly one image for view_{angle:03d}; found {len(matches)} in {INPUT_DIR}")
-    return matches[0]
+    missing_options = [option for option in required_options if option not in rlft_help]
+    if missing_options:
+        raise RuntimeError(
+            "Kaggle fetched an older open_rlft_full_pipeline branch. Missing options: "
+            + ", ".join(missing_options)
+            + ". Commit and push the updated runner before starting this cell."
+        )
+
+def run_direct_reconstruction() -> None:
+    global INPUT_DIR
+    # Kaggle usually mounts a dataset without the owner component.
+    if not INPUT_DIR.is_dir() and "CARVE3D_INPUT_DIR" not in os.environ:
+        INPUT_DIR = next((path for path in INPUT_DIR_FALLBACKS if path.is_dir()), INPUT_DIR)
+    if not INPUT_DIR.is_dir():
+        checked = [INPUT_DIR, *INPUT_DIR_FALLBACKS]
+        raise FileNotFoundError(
+            "Could not find the four-view dataset. Checked:\n  - "
+            + "\n  - ".join(str(path) for path in checked)
+            + "\nSet CARVE3D_INPUT_DIR to the folder containing view_000/090/180/270."
+        )
+
+    def resolve_view(angle: int) -> Path:
+        aliases = {f"view_{angle:03d}", f"view{angle:03d}", f"view_{angle}", f"view{angle}", str(angle)}
+        matches = sorted(
+            path for path in INPUT_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            and path.stem.lower() in aliases
+        )
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"Need exactly one image for view_{angle:03d}; found {len(matches)} in {INPUT_DIR}"
+            )
+        return matches[0]
+
+    source_paths = [resolve_view(angle) for angle in (0, 90, 180, 270)]
+    print("Preview source views before reconstruction/calibration:")
+    for angle, path in zip((0, 90, 180, 270), source_paths):
+        print(f"  {angle:03d}° -> {path}")
+
+    preview_size = 320
+    preview = Image.new("RGB", (preview_size * 2, (preview_size + 28) * 2), "white")
+    for index, (angle, path) in enumerate(zip((0, 90, 180, 270), source_paths)):
+        image = ImageOps.contain(Image.open(path).convert("RGB"), (preview_size, preview_size))
+        tile = Image.new("RGB", (preview_size, preview_size), "white")
+        tile.paste(image, ((preview_size - image.width) // 2, (preview_size - image.height) // 2))
+        x = (index % 2) * preview_size
+        y = (index // 2) * (preview_size + 28)
+        preview.paste(tile, (x, y))
+        ImageDraw.Draw(preview).text((x + 8, y + preview_size + 6), f"view_{angle:03d}", fill="black")
+    display(preview)
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "kaggle_import_four_views.py"),
+            "--input-dir", str(INPUT_DIR),
+            "--output-dir", str(DIRECT_OUTPUT_DIR),
+            "--lgm-root", str(LGM_ROOT),
+            "--lgm-device", "1",
+            "--render-size", "256",
+            "--no-orbit",
+            "--elevation-candidates", "-10", "-5", "0", "5", "10",
+            *( ["--appearance-search"] if DIRECT_APPEARANCE_SEARCH else [] ),
+        ],
+        check=True,
+    )
 
 
-source_paths = [resolve_view(angle) for angle in (0, 90, 180, 270)]
-print("Preview source views before reconstruction/calibration:")
-for angle, path in zip((0, 90, 180, 270), source_paths):
-    print(f"  {angle:03d}° -> {path}")
+if RUN_DIRECT_RECONSTRUCTION:
+    run_direct_reconstruction()
+else:
+    print("Skipping unrelated direct-photo stage; starting paper-style RLFT setup.")
+    checkpoint = LGM_ROOT / "pretrained" / "model_fp16_fixrot.safetensors"
+    if not checkpoint.is_file():
+        subprocess.run(["bash", str(REPO / "scripts" / "setup_lgm_kaggle.sh"), str(LGM_ROOT)], check=True)
 
-preview_size = 320
-preview = Image.new("RGB", (preview_size * 2, (preview_size + 28) * 2), "white")
-for index, (angle, path) in enumerate(zip((0, 90, 180, 270), source_paths)):
-    image = ImageOps.contain(Image.open(path).convert("RGB"), (preview_size, preview_size))
-    tile = Image.new("RGB", (preview_size, preview_size), "white")
-    tile.paste(image, ((preview_size - image.width) // 2, (preview_size - image.height) // 2))
-    x = (index % 2) * preview_size
-    y = (index // 2) * (preview_size + 28)
-    preview.paste(tile, (x, y))
-    ImageDraw.Draw(preview).text((x + 8, y + preview_size + 6), f"view_{angle:03d}", fill="black")
-display(preview)
-
-# Stage A. Validates all four real images before downloading/compiling LGM,
-# then runs safe direct appearance calibration.
-# First run automatically installs LGM quietly and downloads its public weights.
-subprocess.run(
-    [
-        sys.executable,
-        str(REPO / "kaggle_import_four_views.py"),
-        "--input-dir", str(INPUT_DIR),
-        "--output-dir", str(DIRECT_OUTPUT_DIR),
-        "--lgm-root", str(LGM_ROOT),
-        "--lgm-device", "1",
-        "--render-size", "256",
-        "--no-orbit",
-        "--elevation-candidates", "-10", "-5", "0", "5", "10",
-        *( ["--appearance-search"] if DIRECT_APPEARANCE_SEARCH else [] ),
-    ],
-    check=True,
-)
-
-# Stage B + C. Quality RLFT: public MVDream/LGM, reward = -MRC, validation
-# best-checkpoint selection, then post-RL output from the best LoRA state.
+# Stage B + C (optional). Paper-style RLFT: public MVDream/LGM, reward =
+# -MRC, validation best-checkpoint selection, then post-RL output from the best
+# LoRA state. This stage never reads INPUT_DIR as an RL sample batch.
 rlft_command = [
     sys.executable,
     str(REPO / "open_mvdream_rlft.py"),
@@ -157,9 +218,11 @@ rlft_command = [
     "--output-dir", str(RLFT_OUTPUT_DIR),
     "--diffusion-device", "0",
     "--lgm-device", "1",
+    "--overlap-reward",
     "--epochs", str(RL_EPOCHS),
     "--samples-per-epoch", str(RL_SAMPLES_PER_EPOCH),
     "--prompts-per-update", str(RL_PROMPTS_PER_UPDATE),
+    "--curate-prompt-count", str(RL_CURATE_PROMPT_COUNT),
     "--num-steps", str(RL_DDIM_STEPS),
     "--guidance-scale", str(RL_GUIDANCE_SCALE),
     "--learning-rate", str(RL_LEARNING_RATE),
@@ -167,24 +230,32 @@ rlft_command = [
     "--kl-coeff", str(RL_KL_COEFF),
     "--timestep-loss-reduction", RL_TIMESTEP_REDUCTION,
     "--advantage-clip", str(RL_ADVANTAGE_CLIP),
+    "--stat-buffer-epochs", str(RL_STAT_BUFFER_EPOCHS),
+    "--kl-early-stop-threshold", str(RL_KL_EARLY_STOP_THRESHOLD),
     "--min-validation-improvement", str(RL_MIN_VALIDATION_IMPROVEMENT),
     "--mrc-metric", RL_MRC_METRIC,
     "--early-stop-patience", str(RL_EARLY_STOP_PATIENCE),
-    "--transactional-validation",
     "--final-candidates", str(FINAL_CANDIDATES),
-    "--final-prompt", "a wooden chair, isolated studio product photograph, white background",
+    # Pass this explicitly for compatibility with both the old Kaggle branch
+    # runner and the new --target-prompt-aware runner.
+    "--final-prompt", FINAL_EVAL_PROMPT,
 ]
 for prompt in TRAIN_PROMPTS:
     rlft_command.extend(["--prompt", prompt])
 for prompt in VALIDATION_PROMPTS:
     rlft_command.extend(["--validation-prompt", prompt])
 if RUN_PROMPT_RLFT:
+    print("Starting paper-style public RLFT. This output is separate from the four-photo reconstruction.")
     subprocess.run(rlft_command, check=True)
 else:
-    print("Skipped prompt RLFT: it cannot improve reconstruction from your four real photos.")
+    print(
+        "Skipped prompt RLFT (recommended for external-image reconstruction): "
+        "the direct PLY already uses your four real photos."
+    )
 
 print("\nCOMPLETED")
-print("Direct four-image reconstruction:", DIRECT_OUTPUT_DIR)
+if RUN_DIRECT_RECONSTRUCTION:
+    print("Direct four-image reconstruction:", DIRECT_OUTPUT_DIR)
 if RUN_PROMPT_RLFT:
     print("Open RLFT output/checkpoint:", RLFT_OUTPUT_DIR)
     print("Post-RL MRC:", RLFT_OUTPUT_DIR / "rlft_metrics.json")
