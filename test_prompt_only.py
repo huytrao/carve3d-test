@@ -10,6 +10,7 @@ four-real-view mode of full_pipeline/run.py.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,30 @@ from PIL import Image
 
 MVDREAM_CHECKPOINT = "ashawkey/mvdream-sd2.1-diffusers"
 ANGLES = (0, 90, 180, 270)
+
+
+def silence_huggingface_progress() -> None:
+    """Hide model-loading/generation tqdm output while retaining real errors."""
+
+    # Set before importing MVDream, which imports Diffusers/Transformers.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+        transformers_logging.disable_progress_bar()
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from diffusers.utils import logging as diffusers_logging
+
+        diffusers_logging.set_verbosity_error()
+        diffusers_logging.disable_progress_bar()
+    except (ImportError, AttributeError):
+        pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +68,7 @@ def main() -> None:
         raise FileNotFoundError(f"LGM source missing at {args.lgm_root}; run scripts/setup_lgm_kaggle.sh first.")
     sys.path.insert(0, str(args.lgm_root.resolve()))
 
+    silence_huggingface_progress()
     import torch
     from mvdream.pipeline_mvdream import MVDreamPipeline
 
@@ -56,6 +82,8 @@ def main() -> None:
     pipe = MVDreamPipeline.from_pretrained(
         MVDREAM_CHECKPOINT, torch_dtype=torch.float16, trust_remote_code=True
     ).to(device)
+    if hasattr(pipe, "set_progress_bar_config"):
+        pipe.set_progress_bar_config(disable=True)
     images = pipe(
         args.prompt,
         negative_prompt="",

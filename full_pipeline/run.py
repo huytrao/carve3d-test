@@ -30,6 +30,29 @@ LGM_CHECKPOINT_URL = "https://huggingface.co/ashawkey/LGM/resolve/main/model_fp1
 MVDREAM_CHECKPOINT = "ashawkey/mvdream-sd2.1-diffusers"
 
 
+def _silence_huggingface_progress() -> None:
+    """Hide Diffusers/Transformers tqdm noise without suppressing exceptions."""
+
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+    try:
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+        transformers_logging.disable_progress_bar()
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from diffusers.utils import logging as diffusers_logging
+
+        diffusers_logging.set_verbosity_error()
+        diffusers_logging.disable_progress_bar()
+    except (ImportError, AttributeError):
+        pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Four-view LGM reconstruction and Carve3D-style MRC evaluation."
@@ -165,6 +188,7 @@ def _make_grid(images: Sequence[np.ndarray]) -> np.ndarray:
 
 
 def _source_views_from_prompt(prompt: str, seed: int, device, elevation: float) -> list[np.ndarray]:
+    _silence_huggingface_progress()
     import torch
     import kiui
     from mvdream.pipeline_mvdream import MVDreamPipeline
@@ -173,6 +197,8 @@ def _source_views_from_prompt(prompt: str, seed: int, device, elevation: float) 
     pipe = MVDreamPipeline.from_pretrained(
         MVDREAM_CHECKPOINT, torch_dtype=torch.float16, trust_remote_code=True
     ).to(device)
+    if hasattr(pipe, "set_progress_bar_config"):
+        pipe.set_progress_bar_config(disable=True)
     generated = pipe(
         prompt,
         negative_prompt="",
