@@ -104,6 +104,22 @@ For the most direct Kaggle experience, upload
 Code cell that passes the prompt explicitly rather than relying on notebook
 `sys.argv`.
 
+### Prompt-only smoke test
+
+Before a full reconstruction run, test only the public MVDream prompt stage:
+
+```bash
+python test_prompt_only.py \
+  --lgm-root /kaggle/working/LGM \
+  --prompt "a wooden chair, studio product photograph, centered object, white background" \
+  --num-steps 20 \
+  --output-dir /kaggle/working/prompt-smoke-test
+```
+
+It saves four canonical `view_000.png` … `view_270.png` images and
+`prompt_grid.png`, without loading LGM's reconstruction model or computing
+MRC. The output can be inspected before running the full prompt pipeline.
+
 Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
 test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
 Lower MRC is better.  The precise source order and all checkpoint metadata are
