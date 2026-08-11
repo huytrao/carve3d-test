@@ -27,7 +27,7 @@ LGM_ROOT = WORKDIR / "LGM"
 # view_0.png; all four orientations (0, 90, 180, 270) are required.
 INPUT_DIR = Path("/kaggle/input/datasets/traoanhuy/carve3d/views")
 DIRECT_OUTPUT_DIR = WORKDIR / "carve3d-direct-four-view-calibrated-output"
-RLFT_OUTPUT_DIR = WORKDIR / "carve3d-open-rlft-output-v3"
+RLFT_OUTPUT_DIR = WORKDIR / "carve3d-open-rlft-output-v4"
 
 # This is the safe path for YOUR four photographs. It starts from LGM's
 # Gaussian prediction, then tests forward-only global colour/opacity/scale
@@ -39,16 +39,23 @@ DIRECT_APPEARANCE_SEARCH = True
 # paper-style experiment and does not modify the direct four-photo PLY above.
 RUN_PROMPT_RLFT = True
 
-# Conservative quality profile for T4 x2. Each update scores eight random
-# noises for one prompt, then transactional held-out validation retains an
-# update only if it lowers MRC; rejected weights and AdamW moments are rolled
-# back. This is still far smaller than the paper's 48-A100 run.
+# Stabilized quality profile for T4 x2. Each update mixes two prompts with four
+# trajectories each and normalizes reward/KL inside each prompt group. Exact
+# frozen-base KL, fp32 DDIM log probabilities, and transactional validation
+# prevent the near-zero KL and gradient spikes seen in the older v3 run.
 RL_EPOCHS = 8
 RL_SAMPLES_PER_EPOCH = 8
-RL_DDIM_STEPS = 40
+RL_PROMPTS_PER_UPDATE = 2
+RL_DDIM_STEPS = 30  # Official public MVDream/LGM text pipeline setting.
+RL_GUIDANCE_SCALE = 7.5
 RL_LEARNING_RATE = 1e-5
+RL_REWARD_COEFF = 1.0
+RL_KL_COEFF = 0.2
+RL_TIMESTEP_REDUCTION = "mean"
+RL_ADVANTAGE_CLIP = 5.0
+RL_MIN_VALIDATION_IMPROVEMENT = 1e-4
 RL_MRC_METRIC = "lpips"  # Paper metric. Use "l1" only when LPIPS download is blocked.
-RL_EARLY_STOP_PATIENCE = 6
+RL_EARLY_STOP_PATIENCE = 4
 FINAL_CANDIDATES = 8
 TRAIN_PROMPTS = [
     "a wooden chair, isolated studio product photograph, white background",
@@ -61,8 +68,8 @@ TRAIN_PROMPTS = [
     "a woven picnic basket, isolated studio product photograph, white background",
 ]
 VALIDATION_PROMPTS = [
-    "a red toy car, isolated studio product photograph, white background",
-    "a brass table lamp, isolated studio product photograph, white background",
+    "a green desk fan, isolated studio product photograph, white background",
+    "a canvas hiking backpack, isolated studio product photograph, white background",
 ]
 
 # Public model downloads and package setup stay quiet; actual metrics/errors are
@@ -152,8 +159,15 @@ rlft_command = [
     "--lgm-device", "1",
     "--epochs", str(RL_EPOCHS),
     "--samples-per-epoch", str(RL_SAMPLES_PER_EPOCH),
+    "--prompts-per-update", str(RL_PROMPTS_PER_UPDATE),
     "--num-steps", str(RL_DDIM_STEPS),
+    "--guidance-scale", str(RL_GUIDANCE_SCALE),
     "--learning-rate", str(RL_LEARNING_RATE),
+    "--reward-coeff", str(RL_REWARD_COEFF),
+    "--kl-coeff", str(RL_KL_COEFF),
+    "--timestep-loss-reduction", RL_TIMESTEP_REDUCTION,
+    "--advantage-clip", str(RL_ADVANTAGE_CLIP),
+    "--min-validation-improvement", str(RL_MIN_VALIDATION_IMPROVEMENT),
     "--mrc-metric", RL_MRC_METRIC,
     "--early-stop-patience", str(RL_EARLY_STOP_PATIENCE),
     "--transactional-validation",

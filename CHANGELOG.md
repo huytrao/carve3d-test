@@ -76,6 +76,24 @@ All material pipeline changes are recorded here.
 - Re-enable the actual public-MVDream LoRA RLFT stage by default after direct
   four-photo reconstruction, while documenting that it writes a separate
   prompt-model experiment rather than changing the exported direct PLY.
+- Replace the ineffective KL-to-behaviour quadratic with Carve3D's sampled
+  trajectory KL against frozen base MVDream (`log p_current - log p_base`),
+  normalized per prompt and folded into the score-function advantage.
+- Compute DDIM Gaussian log probabilities in fp32 on the exact fp16 action
+  returned to the next denoising step, average the small-batch T4 loss over
+  stochastic timesteps, keep sample/replay in UNet eval mode, and print replay
+  log-probability error to expose policy mismatches and gradient spikes.
+- Mix two prompts per update with four trajectories each, clip advantages at
+  5, require a material validation improvement before accepting an update,
+  and use held-out categories instead of the previous toy-car overlap.
+- Match the public LGM text pipeline by removing MVDream backgrounds,
+  recentering foregrounds, and compositing on white before reward
+  reconstruction. The reusable rembg session is pinned to ONNX CPU to avoid
+  Kaggle CUDA-provider warning spam.
+- Set AdamW betas, epsilon, and weight decay explicitly; the previous implicit
+  PyTorch weight decay (`1e-2`) was 100x the paper's reported `1e-4`.
+- Add a detailed v3 non-convergence diagnosis to `docs/OPEN_RLFT.md` and move
+  the one-cell run to a fresh `carve3d-open-rlft-output-v4` directory.
 
 ## Earlier work — `implement_full_pipeline`
 

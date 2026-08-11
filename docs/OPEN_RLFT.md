@@ -25,19 +25,25 @@ TODOs.
 2. Public MVDream samples a stochastic four-view DDIM trajectory on GPU 0.
 3. Public LGM renders the corresponding reconstruction on GPU 1. Its foreground
    crop LPIPS distance is MRC; the RL reward is `-MRC`.
-4. The runner normalizes rewards into advantages and makes exactly one
-   score-function (pure on-policy) LoRA update per sampled batch. It records an
-   approximate KL-to-behaviour-policy penalty, then saves only LoRA tensors.
-5. A fresh post-RL prompt sample is reconstructed and evaluated.
+4. For every sampled transition, the runner also evaluates the same action
+   under frozen base MVDream (LoRA temporarily disabled). The trajectory KL is
+   the timestep-average `log p_current - log p_base`, matching paper Eq. (8).
+5. Reward and base-KL are normalized independently inside each prompt group.
+   Their combined advantage drives exactly one score-function (pure on-policy)
+   LoRA update per sampled batch, then only LoRA tensors are saved.
+6. MVDream outputs are background-matted, recentered, and composited on white
+   before LGM, matching LGM's official text-to-3D preprocessing.
+7. A fresh post-RL prompt sample is reconstructed and evaluated.
 
-`code.txt` uses the safe quality profile for T4 x2: eight updates, eight
-same-prompt stochastic trajectories per update, 40 DDIM steps, and
-transactional held-out validation after every update. An update is accepted
-only if its fixed-seed validation MRC is lower; otherwise the LoRA tensors and
-AdamW state are restored. It also selects the lowest-MRC result across eight
-fixed final seeds, recorded explicitly as inference-time best-of-N selection.
-This prevents the small noisy batches from silently accumulating worse LoRA
-updates; it does not make the selection a paper result.
+`code.txt` uses the stabilized quality profile for T4 x2: eight updates, two
+prompts per update, four stochastic trajectories per prompt, and the official
+public MVDream/LGM setting of 30 DDIM steps. Timestep losses are averaged so
+their scale does not grow with the step count. Transactional held-out
+validation requires at least `1e-4` absolute MRC improvement; otherwise LoRA
+tensors and AdamW state are restored. It also selects the lowest-MRC result
+across eight fixed final seeds, recorded explicitly as inference-time
+best-of-N selection. These safeguards limit small-batch damage; they do not
+turn the public substitute into a paper-scale reproduction.
 
 The paper trained for 55 epochs on 48 A100 80GB GPUs, with batch size 768,
 taking 16.5 hours. Increasing this Kaggle profile further increases cost
@@ -48,9 +54,47 @@ The LoRA part follows the paper's reported recipe where it is applicable:
 rank 4, frozen fp16 base networks, fp32 LoRA UNet weights, AdamW learning rate
 `3e-4`, and a `0.2` KL coefficient. That `3e-4` was for their batch-768
 training; this T4 small-batch profile deliberately uses `1e-5` and keeps the
-same `0.2` KL coefficient. The source MVDream/LGM replacement has a different
-architecture and reward implementation, so this is not a claim that the
-resulting weights are compatible with the unavailable Instant3D model.
+same `0.2` KL coefficient. AdamW explicitly uses the paper's betas, epsilon,
+and `1e-4` weight decay; relying on PyTorch defaults would use `1e-2` weight
+decay. The source MVDream/LGM replacement has a different architecture and
+reward implementation, so this is not a claim that the resulting weights are
+compatible with the unavailable Instant3D model.
+
+## Why the v3 T4 run did not converge
+
+The reported v3 validation moved from `0.923640` to `0.922821`: only
+`0.000819`, or about `0.089%`. The epoch-3 gradient norm simultaneously jumped
+from roughly `0.009` to `0.311`, more than 30x, while that update improved
+validation by only `0.000025`. That pattern is gradient variance, not useful
+convergence.
+
+There were several concrete causes:
+
+- The old “KL” was a quadratic difference from the just-sampled behaviour
+  policy. Before the single on-policy update those policies are identical, so
+  it contributed essentially zero and did not regularize toward base MVDream.
+- Each update contained one prompt, and each of eight prompts appeared only
+  once. Therefore training means from different epochs measured different
+  object difficulty and were not a learning curve.
+- DDIM Gaussian density used implicit mixed precision and scored the
+  pre-return sample, while replay received the sample after its fp16 cast. At
+  late timesteps that rounding is large relative to the small variance, so the
+  supposedly identical sample/replay policies can disagree. V4 explicitly
+  evaluates fp32 density on the exact returned action.
+- The score fed raw MVDream images to LGM even though official LGM inference
+  removes backgrounds and recenters objects. Much of the reward therefore
+  measured input-distribution mismatch rather than view consistency.
+- Validation used only two prompts and one was nearly duplicated in training
+  (`small red toy car` versus `red toy car`). Improvements of a few `1e-5`
+  were accepted even though they are below a useful decision margin.
+- The run collected 64 trajectories. The paper used batch 768 for 55 epochs,
+  about 42,240 trajectories, with a different SDXL/Instant3D model and 48
+  A100s. Absolute MRC values and convergence rates are not comparable.
+
+The v4 implementation corrects the algorithmic issues above, prints
+`KL_base`, `grad_norm`, and `replay_error`, and uses disjoint validation
+categories. It still cannot guarantee a large visual improvement at T4 scale;
+the fixed validation MRC, not per-epoch training MRC, is the acceptance signal.
 
 ## Real four-photo calibration
 

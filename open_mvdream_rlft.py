@@ -12,9 +12,8 @@ leaves those functions as TODOs.  This runner uses MVDream and LGM only as an
 open, executable substitute and writes its result metadata accordingly.
 
 For Kaggle T4 x2, GPU 0 holds MVDream and its LoRA update; GPU 1 holds LGM and
-the LPIPS MRC reward.  The default is a real one-epoch, two-sample RL smoke
-run.  Paper-scale 55-epoch training used 48 A100 80 GB GPUs and is not a
-reasonable expectation for two T4s.
+the LPIPS MRC reward. Paper-scale 55-epoch training used 48 A100 80 GB GPUs
+and is not a reasonable expectation for two T4s.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import json
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=16, help="On-policy RL updates.")
     parser.add_argument("--samples-per-epoch", type=int, default=4, help="Same-prompt trajectories per update; at least 2 are required for advantages.")
+    parser.add_argument(
+        "--prompts-per-update",
+        type=int,
+        default=1,
+        help="Distinct prompts in each update; samples-per-epoch must divide evenly and leave at least 2 samples per prompt.",
+    )
     parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--eta", type=float, default=1.0, help="Stochastic DDIM eta; non-zero is required for policy log probabilities.")
@@ -92,8 +98,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=float, default=4.0)
-    parser.add_argument("--kl-coeff", type=float, default=0.2, help="Approximate KL-to-sampling-policy penalty.")
+    parser.add_argument("--reward-coeff", type=float, default=1.0)
+    parser.add_argument(
+        "--kl-coeff",
+        type=float,
+        default=0.2,
+        help="Coefficient for per-prompt normalized trajectory KL to the frozen base MVDream policy.",
+    )
+    parser.add_argument(
+        "--timestep-loss-reduction",
+        choices=("mean", "sum"),
+        default="mean",
+        help="Mean is stable across DDIM step counts on small T4 batches; sum matches the paper equation literally.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--advantage-clip",
+        type=float,
+        default=5.0,
+        help="Clamp the combined reward/KL advantage, matching the released Carve3D trainer default.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--elevation", type=float, default=0.0)
     parser.add_argument("--diffusion-device", type=int, default=0)
@@ -109,6 +133,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
     parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
+    parser.add_argument(
+        "--min-validation-improvement",
+        type=float,
+        default=1e-4,
+        help="Minimum absolute MRC reduction required to accept a transactional update.",
+    )
     parser.add_argument(
         "--transactional-validation",
         action="store_true",
@@ -135,8 +165,8 @@ def default_prompts() -> list[str]:
 
 def default_validation_prompts() -> list[str]:
     return [
-        "a red toy car, isolated studio product photograph, white background",
-        "a brass table lamp, isolated studio product photograph, white background",
+        "a green desk fan, isolated studio product photograph, white background",
+        "a canvas hiking backpack, isolated studio product photograph, white background",
     ]
 
 
@@ -156,6 +186,7 @@ def make_lora_linear(base_layer: Any, rank: int, alpha: float) -> Any:
             super().__init__()
             self.base = base
             self.scale = alpha / rank
+            self.rlft_lora_enabled = True
             for parameter in self.base.parameters():
                 parameter.requires_grad_(False)
             # Match Carve3D's mixed-precision recipe: the frozen base UNet is
@@ -166,6 +197,8 @@ def make_lora_linear(base_layer: Any, rank: int, alpha: float) -> Any:
 
         def forward(self, inputs):
             base_output = self.base(inputs)
+            if not self.rlft_lora_enabled:
+                return base_output
             # Explicitly disable autocast for this residual: otherwise CUDA
             # would silently cast both fp32 LoRA matrices back to fp16.
             with torch.autocast(device_type=inputs.device.type, enabled=False):
@@ -173,6 +206,21 @@ def make_lora_linear(base_layer: Any, rank: int, alpha: float) -> Any:
             return base_output + (residual * self.scale).to(dtype=base_output.dtype)
 
     return _LoRALinear(base_layer)
+
+
+@contextmanager
+def disable_lora(unet: Any):
+    """Temporarily expose the frozen base policy without a second UNet copy."""
+
+    modules = [module for module in unet.modules() if hasattr(module, "rlft_lora_enabled")]
+    previous = [module.rlft_lora_enabled for module in modules]
+    for module in modules:
+        module.rlft_lora_enabled = False
+    try:
+        yield
+    finally:
+        for module, enabled in zip(modules, previous):
+            module.rlft_lora_enabled = enabled
 
 
 def inject_attention_lora(unet: Any, rank: int, alpha: float) -> int:
@@ -210,6 +258,8 @@ class Transition:
     latent: Any
     next_latent: Any
     behavior_log_prob: Any
+    base_log_prob: Any
+    is_stochastic: bool
 
 
 @dataclass
@@ -222,6 +272,7 @@ class Trajectory:
     ordered_images: np.ndarray
     mrc: float | None = None
     reward: float | None = None
+    kl_to_base: float | None = None
 
 
 def _check_devices(diffusion_device: int, lgm_device: int) -> tuple[Any, Any]:
@@ -263,7 +314,9 @@ def load_mvdream_with_lora(lgm_root: Path, device: Any, rank: int, alpha: float)
     pipe.unet.to(device)
     pipe.vae.eval()
     pipe.text_encoder.eval()
-    pipe.unet.train()
+    # Eval mode does not disable autograd. Keeping dropout/training-only layers
+    # disabled makes the replayed policy match the policy used for sampling.
+    pipe.unet.eval()
     if hasattr(pipe, "set_progress_bar_config"):
         pipe.set_progress_bar_config(disable=True)
     print(f"Loaded public MVDream with {injected} LoRA attention projections.")
@@ -314,6 +367,8 @@ def sample_trajectory(
     pipe._rlft_guidance_scale = guidance_scale
     generator = torch.Generator(device=device).manual_seed(seed)
     pipe.scheduler.set_timesteps(num_steps, device=device)
+    was_training = pipe.unet.training
+    pipe.unet.eval()
     with torch.no_grad():
         prompt_embeddings = pipe._encode_prompt(
             prompt=prompt,
@@ -347,17 +402,48 @@ def sample_trajectory(
                 eta=eta,
                 generator=generator,
             )
+            # Carve3D regularizes against the frozen base model, not against
+            # the just-sampled behaviour policy. Reuse the same UNet weights
+            # with LoRA disabled so T4 does not need a second model copy.
+            with disable_lora(pipe.unet):
+                base_noise_prediction = _guided_noise(
+                    pipe, old_latents, timestep_int, prompt_embeddings, camera
+                )
+                _, base_log_prob = ddim_step_with_logprob(
+                    pipe.scheduler,
+                    base_noise_prediction,
+                    torch.full((4,), timestep_int, device=device, dtype=torch.long),
+                    old_latents,
+                    eta=eta,
+                    prev_sample=latents,
+                )
+            is_stochastic = bool(behavior_log_prob.detach().abs().max().item() > 0)
             transitions.append(
                 Transition(
                     timestep=timestep_int,
                     latent=old_latents.detach().cpu(),
                     next_latent=latents.detach().cpu(),
                     behavior_log_prob=behavior_log_prob.detach().cpu(),
+                    base_log_prob=base_log_prob.detach().cpu(),
+                    is_stochastic=is_stochastic,
                 )
             )
         decoded = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
         decoded = ((decoded / 2) + 0.5).clamp(0, 1)
         ordered_images = decoded[list(MVDREAM_TO_LGM)].float().cpu().permute(0, 2, 3, 1).numpy()
+    if was_training:
+        pipe.unet.train()
+    stochastic_transitions = [transition for transition in transitions if transition.is_stochastic]
+    if not stochastic_transitions:
+        raise RuntimeError("No stochastic DDIM transitions were sampled; eta must be positive.")
+    kl_to_base = float(
+        np.mean(
+            [
+                (transition.behavior_log_prob.float() - transition.base_log_prob.float()).mean().item()
+                for transition in stochastic_transitions
+            ]
+        )
+    )
     return Trajectory(
         prompt=prompt,
         seed=seed,
@@ -365,6 +451,7 @@ def sample_trajectory(
         camera=camera.detach().cpu(),
         transitions=transitions,
         ordered_images=ordered_images,
+        kl_to_base=kl_to_base,
     )
 
 
@@ -373,6 +460,7 @@ class LgmMrcScorer:
 
     def __init__(self, lgm_root: Path, device_index: int, render_size: int, metric: str, elevation: float) -> None:
         import torch
+        import rembg
         from full_pipeline.run import _load_lgm
 
         self.metric = metric
@@ -383,8 +471,39 @@ class LgmMrcScorer:
         self.lpips = self.mrc_helpers._lpips_model(self.device) if metric == "lpips" else None
         self.torch = torch
 
+        # LGM's official text-to-3D path removes the background and recenters
+        # every MVDream view before reconstruction. Feeding raw MVDream RGB to
+        # LGM creates a large train/inference mismatch, so MRC mostly measures
+        # background/crop failure instead of multi-view consistency. Force the
+        # CPU provider to avoid Kaggle's noisy onnxruntime CUDA-provider probe.
+        self.rembg = rembg
+        self.background_session = rembg.new_session(providers=["CPUExecutionProvider"])
+
+    def _prepare_lgm_views(self, ordered_images: np.ndarray) -> np.ndarray:
+        """Apply the official LGM MVDream matte/recenter/white-bg preprocessing."""
+
+        from kiui.op import recenter
+
+        prepared: list[np.ndarray] = []
+        for image in ordered_images:
+            uint8 = np.clip(image * 255, 0, 255).astype(np.uint8)
+            rgba = self.rembg.remove(uint8, session=self.background_session)
+            if rgba.ndim != 3 or rgba.shape[-1] != 4:
+                raise RuntimeError(f"rembg returned an invalid image shape: {rgba.shape}")
+            mask = rgba[..., 3] > 0
+            if mask.any():
+                rgba = recenter(rgba, mask, border_ratio=0.2)
+            rgb = rgba[..., :3].astype(np.float32) / 255.0
+            alpha = rgba[..., 3:4].astype(np.float32) / 255.0
+            composite = rgb * alpha + (1.0 - alpha)
+            square = Image.fromarray(np.clip(composite * 255, 0, 255).astype(np.uint8)).resize(
+                (256, 256), Image.Resampling.LANCZOS
+            )
+            prepared.append(np.asarray(square, dtype=np.float32) / 255.0)
+        return np.stack(prepared)
+
     def _prepared_tensor(self, ordered_images: np.ndarray) -> Any:
-        """Prepare generated RGB views without rembg; MRC itself finds white-background crops."""
+        """Resize already-matted RGB views for LGM reconstruction and MRC."""
 
         import torch.nn.functional as functional
 
@@ -411,13 +530,16 @@ class LgmMrcScorer:
             values.append(value)
         return float(sum(values) / len(values)), details
 
-    def score(self, ordered_images: np.ndarray) -> tuple[float, np.ndarray, list[dict[str, Any]]]:
-        """Return MRC distance (lower is better), LGM renders, and per-view metadata."""
+    def score(
+        self, ordered_images: np.ndarray
+    ) -> tuple[float, np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        """Return MRC, prepared sources, LGM renders, and per-view metadata."""
 
         import torch.nn.functional as functional
         from full_pipeline.run import _render_views
 
-        inputs = self._prepared_tensor(ordered_images)
+        prepared_images = self._prepare_lgm_views(ordered_images)
+        inputs = self._prepared_tensor(prepared_images)
         normalized = inputs.clone()
         mean = self.torch.tensor((0.485, 0.456, 0.406), device=self.device).view(1, 3, 1, 1)
         std = self.torch.tensor((0.229, 0.224, 0.225), device=self.device).view(1, 3, 1, 1)
@@ -430,7 +552,7 @@ class LgmMrcScorer:
         resized_inputs = functional.interpolate(inputs, size=rendered.shape[-2:], mode="bilinear", align_corners=False)
         mrc, details = self._mrc(resized_inputs, rendered)
         rendered_images = rendered.permute(0, 2, 3, 1).float().cpu().numpy()
-        return mrc, rendered_images, details
+        return mrc, prepared_images, rendered_images, details
 
 
 def _save_grid(images: np.ndarray, destination: Path) -> None:
@@ -444,10 +566,11 @@ def _save_grid(images: np.ndarray, destination: Path) -> None:
 
 
 def score_and_save(trajectory: Trajectory, scorer: LgmMrcScorer, destination: Path) -> None:
-    mrc, rendered, details = scorer.score(trajectory.ordered_images)
+    mrc, prepared, rendered, details = scorer.score(trajectory.ordered_images)
     trajectory.mrc = mrc
     trajectory.reward = -mrc  # Paper's reward is negative MRC: lower reconstruction discrepancy is better.
     _save_grid(trajectory.ordered_images, destination / "source_grid.png")
+    _save_grid(prepared, destination / "prepared_source_grid.png")
     _save_grid(rendered, destination / "render_grid.png")
     (destination / "reward.json").write_text(
         json.dumps(
@@ -456,6 +579,7 @@ def score_and_save(trajectory: Trajectory, scorer: LgmMrcScorer, destination: Pa
                 "seed": trajectory.seed,
                 "mrc": mrc,
                 "reward_negative_mrc": trajectory.reward,
+                "trajectory_kl_to_base": trajectory.kl_to_base,
                 "mrc_metric": scorer.metric,
                 "views": details,
             },
@@ -465,22 +589,39 @@ def score_and_save(trajectory: Trajectory, scorer: LgmMrcScorer, destination: Pa
     )
 
 
+def grouped_normalized_advantages(
+    values: Sequence[float], group_ids: Sequence[str], epsilon: float = 1e-6
+) -> list[float]:
+    """Normalize values independently for each prompt in the current on-policy batch."""
+
+    if len(values) != len(group_ids):
+        raise ValueError("values and group_ids must have the same length")
+    result = np.zeros(len(values), dtype=np.float32)
+    for group_id in dict.fromkeys(group_ids):
+        indexes = [index for index, candidate in enumerate(group_ids) if candidate == group_id]
+        group = np.asarray([values[index] for index in indexes], dtype=np.float32)
+        standard_deviation = float(group.std())
+        normalized = np.zeros_like(group) if standard_deviation < epsilon else (group - group.mean()) / standard_deviation
+        for index, value in zip(indexes, normalized):
+            result[index] = value
+    return result.tolist()
+
+
 def replay_policy_gradient(
     pipe: Any,
     trajectories: Sequence[Trajectory],
     advantages: Sequence[float],
     device: Any,
     eta: float,
-    kl_coeff: float,
     max_grad_norm: float,
     optimizer: Any,
-) -> dict[str, float]:
+    timestep_loss_reduction: str,
+) -> dict[str, Any]:
     """One pure on-policy LoRA update over sampled trajectories.
 
     ``behavior_log_prob`` is detached from the just-sampled policy.  The
-    approximate KL term is the local quadratic KL estimator against that
-    behaviour policy, keeping this tiny T4 run close to the base trajectory
-    without retaining a second 2+ GB MVDream UNet on GPU 0.
+    KL-to-base is already folded into ``advantages`` at trajectory level,
+    matching Carve3D's pure on-policy score-function objective.
     """
 
     import torch
@@ -488,14 +629,28 @@ def replay_policy_gradient(
 
     optimizer.zero_grad(set_to_none=True)
     total_policy_loss = 0.0
-    total_kl = 0.0
     usable_steps = 0
-    pipe.unet.train()
-    denominator = max(1, len(trajectories))
+    replay_errors: list[float] = []
+    # Autograd remains enabled in eval mode. This prevents dropout or other
+    # training-only behavior from changing the policy between sample/replay.
+    pipe.unet.eval()
+    stochastic_steps = sum(
+        1 for trajectory in trajectories for transition in trajectory.transitions if transition.is_stochastic
+    )
+    if stochastic_steps == 0:
+        raise RuntimeError("No stochastic DDIM actions were available for the RL update. Increase --num-steps.")
+    if timestep_loss_reduction == "mean":
+        denominator = stochastic_steps
+    elif timestep_loss_reduction == "sum":
+        denominator = max(1, len(trajectories))
+    else:
+        raise ValueError("timestep_loss_reduction must be 'mean' or 'sum'")
     for trajectory, advantage in zip(trajectories, advantages):
         prompt_embeddings = trajectory.prompt_embeddings.to(device=device, dtype=torch.float16)
         camera = trajectory.camera.to(device=device, dtype=torch.float16)
         for transition in trajectory.transitions:
+            if not transition.is_stochastic:
+                continue
             latents = transition.latent.to(device=device, dtype=torch.float16)
             next_latent = transition.next_latent.to(device=device, dtype=torch.float16)
             behavior_log_prob = transition.behavior_log_prob.to(device=device, dtype=torch.float32)
@@ -509,27 +664,22 @@ def replay_policy_gradient(
                     eta=eta,
                     prev_sample=next_latent,
                 )
-                if not current_log_prob.requires_grad:
-                    # The final deterministic DDIM action has no probability density.
-                    continue
                 log_prob = current_log_prob.float().mean()
-                delta = current_log_prob.float() - behavior_log_prob
+                replay_errors.append(float((current_log_prob.detach().float() - behavior_log_prob).abs().mean().cpu()))
                 policy_loss = -float(advantage) * log_prob / denominator
-                kl_loss = kl_coeff * 0.5 * delta.square().mean() / denominator
-                (policy_loss + kl_loss).backward()
+                policy_loss.backward()
             total_policy_loss += float(policy_loss.detach().cpu())
-            total_kl += float(kl_loss.detach().cpu())
             usable_steps += 1
-    if usable_steps == 0:
-        raise RuntimeError("No stochastic DDIM actions were available for the RL update. Increase --num-steps.")
     parameters = [parameter for parameter in pipe.unet.parameters() if parameter.requires_grad]
     grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm).detach().cpu())
     optimizer.step()
     return {
-        "policy_loss": total_policy_loss / usable_steps,
-        "approx_kl_loss": total_kl / usable_steps,
+        "policy_loss": total_policy_loss,
         "grad_norm": grad_norm,
         "stochastic_steps": usable_steps,
+        "timestep_loss_reduction": timestep_loss_reduction,
+        "replay_logprob_mean_abs_error": float(np.mean(replay_errors)),
+        "replay_logprob_max_abs_error": float(np.max(replay_errors)),
     }
 
 
@@ -674,10 +824,21 @@ def main() -> None:
         raise ValueError("--epochs must be at least 1")
     if args.samples_per_epoch < 2:
         raise ValueError("--samples-per-epoch must be at least 2 so RL can compute a reward advantage")
+    if args.prompts_per_update < 1:
+        raise ValueError("--prompts-per-update must be at least 1")
+    if args.samples_per_epoch % args.prompts_per_update != 0:
+        raise ValueError("--samples-per-epoch must divide evenly by --prompts-per-update")
+    samples_per_prompt = args.samples_per_epoch // args.prompts_per_update
+    if samples_per_prompt < 2:
+        raise ValueError("Each prompt needs at least two trajectories for per-prompt advantages")
     if args.num_steps < 2:
         raise ValueError("--num-steps must be at least 2")
     if args.validation_every < 1 or args.early_stop_patience < 1:
         raise ValueError("--validation-every and --early-stop-patience must be at least 1")
+    if args.min_validation_improvement < 0:
+        raise ValueError("--min-validation-improvement cannot be negative")
+    if args.advantage_clip <= 0:
+        raise ValueError("--advantage-clip must be positive")
     if args.final_candidates < 1:
         raise ValueError("--final-candidates must be at least 1")
     prompts = args.prompts or default_prompts()
@@ -693,7 +854,15 @@ def main() -> None:
     import torch
 
     trainable = [parameter for parameter in pipe.unet.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate)
+    # PyTorch AdamW defaults to weight_decay=1e-2, one hundred times the value
+    # reported by Carve3D. Specify the paper optimizer values explicitly.
+    optimizer = torch.optim.AdamW(
+        trainable,
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-4,
+    )
     scorer = LgmMrcScorer(args.lgm_root, args.lgm_device, args.render_size, args.mrc_metric, args.elevation)
     history: list[dict[str, Any]] = []
     validation_seed = args.seed + 1_000_000
@@ -732,49 +901,76 @@ def main() -> None:
         pre_update_state = lora_state(pipe.unet) if args.transactional_validation else None
         pre_update_optimizer_state = copy.deepcopy(optimizer.state_dict()) if args.transactional_validation else None
         trajectories: list[Trajectory] = []
-        # Score multiple random noises for the *same* prompt. This gives the
-        # reward-normalized advantage a meaningful within-prompt comparison,
-        # then cycles over the curated prompt list across epochs.
-        epoch_prompt = prompts[epoch % len(prompts)]
+        # Mix several prompts per update, but normalize reward/KL within each
+        # prompt as Carve3D/DDPO requires. Cycling prompts across updates means
+        # an object category is revisited instead of receiving one update only.
+        epoch_prompts = [
+            prompts[(epoch * args.prompts_per_update + index) % len(prompts)]
+            for index in range(args.prompts_per_update)
+        ]
         print(
             f"[RL {epoch + 1}/{args.epochs}] sampling {args.samples_per_epoch} trajectories "
-            f"for: {epoch_prompt}",
+            f"across {args.prompts_per_update} prompt(s)",
             flush=True,
         )
-        for sample_index in range(args.samples_per_epoch):
-            seed = args.seed + epoch * args.samples_per_epoch + sample_index
-            trajectory = sample_trajectory(
-                pipe,
-                epoch_prompt,
-                seed,
-                diffusion_device,
-                args.num_steps,
-                args.guidance_scale,
-                args.eta,
-                args.elevation,
-            )
-            score_and_save(trajectory, scorer, args.output_dir / "epochs" / f"epoch_{epoch:03d}" / f"sample_{sample_index:03d}")
-            trajectories.append(trajectory)
+        for prompt_index, epoch_prompt in enumerate(epoch_prompts):
             print(
-                f"[RL {epoch + 1}/{args.epochs}] sample {sample_index + 1}/{args.samples_per_epoch} "
-                f"MRC={trajectory.mrc:.6f} reward={trajectory.reward:.6f}",
+                f"[RL {epoch + 1}/{args.epochs}] prompt {prompt_index + 1}/{args.prompts_per_update}: "
+                f"{epoch_prompt}",
                 flush=True,
             )
-            write_training_progress(
-                progress_file,
-                status="running",
-                stage="sampling",
-                current_epoch=epoch + 1,
-                total_epochs=args.epochs,
-                current_sample=sample_index + 1,
-                samples_per_epoch=args.samples_per_epoch,
-                last_mrc=trajectory.mrc,
-                best_epoch=best_epoch,
-                best_validation_mrc=best_validation_mrc,
-            )
+            for prompt_sample_index in range(samples_per_prompt):
+                sample_index = prompt_index * samples_per_prompt + prompt_sample_index
+                seed = args.seed + epoch * args.samples_per_epoch + sample_index
+                trajectory = sample_trajectory(
+                    pipe,
+                    epoch_prompt,
+                    seed,
+                    diffusion_device,
+                    args.num_steps,
+                    args.guidance_scale,
+                    args.eta,
+                    args.elevation,
+                )
+                score_and_save(
+                    trajectory,
+                    scorer,
+                    args.output_dir / "epochs" / f"epoch_{epoch:03d}" / f"sample_{sample_index:03d}",
+                )
+                trajectories.append(trajectory)
+                print(
+                    f"[RL {epoch + 1}/{args.epochs}] sample {sample_index + 1}/{args.samples_per_epoch} "
+                    f"MRC={trajectory.mrc:.6f} KL_base={trajectory.kl_to_base:.6f}",
+                    flush=True,
+                )
+                write_training_progress(
+                    progress_file,
+                    status="running",
+                    stage="sampling",
+                    current_epoch=epoch + 1,
+                    total_epochs=args.epochs,
+                    current_sample=sample_index + 1,
+                    samples_per_epoch=args.samples_per_epoch,
+                    last_mrc=trajectory.mrc,
+                    last_kl_to_base=trajectory.kl_to_base,
+                    best_epoch=best_epoch,
+                    best_validation_mrc=best_validation_mrc,
+                )
 
         rewards = np.asarray([trajectory.reward for trajectory in trajectories], dtype=np.float32)
-        advantages = ((rewards - rewards.mean()) / (rewards.std() + 1e-6)).tolist()
+        kl_values = np.asarray([trajectory.kl_to_base for trajectory in trajectories], dtype=np.float32)
+        group_ids = [trajectory.prompt for trajectory in trajectories]
+        reward_advantages = grouped_normalized_advantages(rewards.tolist(), group_ids)
+        kl_advantages = grouped_normalized_advantages(kl_values.tolist(), group_ids)
+        unclipped_advantages = [
+            args.reward_coeff * reward_advantage - args.kl_coeff * kl_advantage
+            for reward_advantage, kl_advantage in zip(reward_advantages, kl_advantages)
+        ]
+        advantages = np.clip(
+            np.asarray(unclipped_advantages, dtype=np.float32),
+            -args.advantage_clip,
+            args.advantage_clip,
+        ).tolist()
         print(f"[RL {epoch + 1}/{args.epochs}] updating fp32 LoRA weights...", flush=True)
         update = replay_policy_gradient(
             pipe,
@@ -782,22 +978,29 @@ def main() -> None:
             advantages,
             diffusion_device,
             args.eta,
-            args.kl_coeff,
             args.max_grad_norm,
             optimizer,
+            args.timestep_loss_reduction,
         )
         epoch_record = {
             "epoch": epoch,
             "mean_mrc": float(np.mean([-reward for reward in rewards])),
             "mean_reward_negative_mrc": float(rewards.mean()),
             "reward_std": float(rewards.std()),
-            "advantages": advantages,
+            "mean_kl_to_base": float(kl_values.mean()),
+            "kl_to_base_std": float(kl_values.std()),
+            "reward_advantages": reward_advantages,
+            "kl_advantages": kl_advantages,
+            "unclipped_combined_advantages": unclipped_advantages,
+            "combined_advantages": advantages,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
             **update,
         }
         history.append(epoch_record)
         print(
             f"[RL {epoch + 1}/{args.epochs}] update complete: "
-            f"mean_MRC={epoch_record['mean_mrc']:.6f}, grad_norm={update['grad_norm']:.6f}",
+            f"mean_MRC={epoch_record['mean_mrc']:.6f}, mean_KL_base={epoch_record['mean_kl_to_base']:.6f}, "
+            f"grad_norm={update['grad_norm']:.6f}, replay_error={update['replay_logprob_max_abs_error']:.2e}",
             flush=True,
         )
         should_validate = (
@@ -816,14 +1019,20 @@ def main() -> None:
                 args,
             )
             epoch_record["validation_mrc"] = validation["mean_mrc"]
-            improved = validation["mean_mrc"] < best_validation_mrc
+            validation_improvement = best_validation_mrc - validation["mean_mrc"]
+            epoch_record["validation_improvement"] = validation_improvement
+            improved = validation_improvement >= args.min_validation_improvement
             if improved:
                 best_validation_mrc = validation["mean_mrc"]
                 best_epoch = epoch
                 best_state = save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
                 validations_without_improvement = 0
                 epoch_record["update_accepted"] = True
-                print(f"[RL {epoch + 1}/{args.epochs}] new best validation MRC={best_validation_mrc:.6f}", flush=True)
+                print(
+                    f"[RL {epoch + 1}/{args.epochs}] new best validation MRC={best_validation_mrc:.6f}; "
+                    f"improvement={validation_improvement:.6f}",
+                    flush=True,
+                )
             else:
                 validations_without_improvement += 1
                 if args.transactional_validation:
@@ -833,7 +1042,8 @@ def main() -> None:
                     epoch_record["update_accepted"] = False
                     print(
                         f"[RL {epoch + 1}/{args.epochs}] rejected update and restored prior LoRA: "
-                        f"validation MRC={validation['mean_mrc']:.6f}; best={best_validation_mrc:.6f}",
+                        f"validation MRC={validation['mean_mrc']:.6f}; best={best_validation_mrc:.6f}; "
+                        f"required improvement={args.min_validation_improvement:.6f}",
                         flush=True,
                     )
                 else:
@@ -885,14 +1095,21 @@ def main() -> None:
         "rl": {
             "algorithm": "one replay/update per sampled on-policy batch; REINFORCE-style score function",
             "lora_rank": args.lora_rank,
+            "reward_coeff": args.reward_coeff,
             "kl_coeff": args.kl_coeff,
+            "kl_reference": "frozen base MVDream with LoRA disabled on every sampled transition",
             "epochs": args.epochs,
             "samples_per_epoch": args.samples_per_epoch,
+            "prompts_per_update": args.prompts_per_update,
             "ddim_steps": args.num_steps,
             "eta": args.eta,
+            "timestep_loss_reduction": args.timestep_loss_reduction,
+            "advantage_clip": args.advantage_clip,
             "validation_every": args.validation_every,
             "early_stop_patience": args.early_stop_patience,
+            "min_validation_improvement": args.min_validation_improvement,
             "learning_rate": args.learning_rate,
+            "adamw": {"betas": [0.9, 0.999], "epsilon": 1e-8, "weight_decay": 1e-4},
             "transactional_validation": args.transactional_validation,
         },
         "devices": {"mvdream_rl": args.diffusion_device, "lgm_mrc": args.lgm_device},

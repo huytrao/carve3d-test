@@ -189,13 +189,15 @@ the direct four-capture evaluation, then a real on-policy LoRA RLFT cycle:
 
 ```
 public MVDream -> 4 generated views -> public LGM -> bbox LPIPS MRC reward
-                -> reward-normalized score-function LoRA update -> post-RL MRC
+                -> per-prompt reward + frozen-base KL advantages
+                -> one on-policy score-function LoRA update -> post-RL MRC
 ```
 
 It assigns MVDream/RL to GPU 0 and LGM/MRC to GPU 1 on Kaggle T4 x2. The
-default is one small RL epoch, not the paper's 55 epochs on 48 A100 80GB GPUs.
-Read [docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) before comparing results to the
-paper.
+one-cell quality profile uses eight small updates and remains vastly below the
+paper's batch-768, 55-epoch training on 48 A100 80GB GPUs. Read
+[docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) for the v3 non-convergence diagnosis,
+v4 safeguards, and limits before comparing results to the paper.
 
 ## Release TODOs
 - [ ] training and testing text prompt dataset

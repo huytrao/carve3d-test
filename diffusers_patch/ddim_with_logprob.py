@@ -165,15 +165,28 @@ def ddim_step_with_logprob(
     # The final DDIM step is deterministic (zero variance) and has no finite
     # Gaussian log density. Return a zero contribution for that action rather
     # than producing NaN/Inf in an RL loss.
-    safe_std_dev_t = std_dev_t.clamp_min(torch.finfo(std_dev_t.dtype).eps)
+    # Policy log-probabilities are especially sensitive at late DDIM steps,
+    # where sigma is small.  Computing this expression in fp16 clamps every
+    # sigma below ~9.77e-4 to fp16 epsilon and can create discontinuous or
+    # exploding policy gradients.  Keep the UNet/sample in fp16 for T4 memory,
+    # but evaluate the Gaussian density itself in fp32.
+    # The scheduler returns latents in ``sample.dtype``. Use that exact rounded
+    # action for the density as well; otherwise sampling scores an fp32 action
+    # but replay receives its fp16 copy and the supposedly on-policy log-probs
+    # no longer match, especially when sigma is small.
+    returned_prev_sample = prev_sample.to(dtype=sample.dtype)
+    probability_mean = prev_sample_mean.float()
+    probability_sample = returned_prev_sample.detach().float()
+    probability_std = std_dev_t.float()
+    safe_std_dev_t = probability_std.clamp_min(1e-6)
     log_prob = (
-        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (safe_std_dev_t**2))
+        -((probability_sample - probability_mean) ** 2) / (2 * (safe_std_dev_t**2))
         - torch.log(safe_std_dev_t)
-        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        - 0.5 * math.log(2 * math.pi)
     )
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-    deterministic = (std_dev_t.reshape(std_dev_t.shape[0], -1).max(dim=1).values == 0)
+    deterministic = (probability_std.reshape(probability_std.shape[0], -1).max(dim=1).values == 0)
     log_prob = torch.where(deterministic, torch.zeros_like(log_prob), log_prob)
 
-    return prev_sample.type(sample.dtype), log_prob
+    return returned_prev_sample, log_prob
