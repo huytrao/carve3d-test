@@ -47,6 +47,8 @@ All material pipeline changes are recorded here.
 - The open RLFT LoRA now follows the paper's applicable mixed-precision recipe:
   rank 4 fp32 LoRA weights on a frozen fp16 base UNet, with the paper's `3e-4`
   AdamW learning-rate default and `0.2` KL coefficient.
+- Move newly injected fp32 LoRA tensors to the MVDream CUDA device before the
+  first sample, fixing the Kaggle CPU/CUDA matrix-device mismatch.
 
 ## Earlier work — `implement_full_pipeline`
 

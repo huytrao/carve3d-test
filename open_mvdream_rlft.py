@@ -218,6 +218,10 @@ def load_mvdream_with_lora(lgm_root: Path, device: Any, rank: int, alpha: float)
     pipe.vae.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     injected = inject_attention_lora(pipe.unet, rank, alpha)
+    # ``pipe.to(device)`` above ran before LoRA injection. New Parameters are
+    # created on CPU by PyTorch, so move the modified UNet once more; otherwise
+    # the first attention projection mixes CUDA activations with CPU LoRA A/B.
+    pipe.unet.to(device)
     pipe.vae.eval()
     pipe.text_encoder.eval()
     pipe.unet.train()
