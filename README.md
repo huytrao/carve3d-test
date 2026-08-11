@@ -84,6 +84,10 @@ python run_full_pipeline.py
 Override its prompt without editing code with
 `CARVE3D_PROMPT="a ceramic teapot, studio product photograph, centered object, white background" python run_full_pipeline.py`.
 
+To upload one Python file to Kaggle (or paste its entire contents into one Code
+cell), use `kaggle_full_pipeline_prompt_notebook.py`. Edit its `PROMPT` and
+`OUTPUT_DIR` constants, then run it.
+
 Use `--render-size 256` to conserve VRAM, `--no-orbit` for a faster smoke
 test, or `--mrc-metric l1` only when LPIPS model weights cannot be downloaded.
 Lower MRC is better.  The precise source order and all checkpoint metadata are
