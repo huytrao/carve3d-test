@@ -69,6 +69,9 @@ All material pipeline changes are recorded here.
   prints live `[Refine step/120]` progress. Prompt MVDream RL is retained as
   an explicit optional research stage because it cannot improve this direct
   reconstruction.
+- Show a labelled 2×2 preview of the exact 000/090/180/270 source files at
+  the start of the one-cell Kaggle run, before LGM is loaded or refinement
+  begins.
 
 ## Earlier work — `implement_full_pipeline`
 

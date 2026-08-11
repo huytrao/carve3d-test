@@ -15,6 +15,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from IPython.display import display
+from PIL import Image, ImageDraw, ImageOps
+
 REPO_URL = "https://github.com/huytrao/carve3d-test.git"
 BRANCH = "open_rlft_full_pipeline"
 WORKDIR = Path("/kaggle/working")
@@ -89,7 +92,39 @@ else:
         check=True,
     )
 
-# Stage A. Validates all four real images before downloading/compiling LGM.
+# Preview exactly the four source photos before loading LGM or starting direct
+# Gaussian refinement.  This catches reversed/misnamed camera views early.
+def resolve_view(angle: int) -> Path:
+    aliases = {f"view_{angle:03d}", f"view{angle:03d}", f"view_{angle}", f"view{angle}", str(angle)}
+    matches = sorted(
+        path for path in INPUT_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        and path.stem.lower() in aliases
+    )
+    if len(matches) != 1:
+        raise FileNotFoundError(f"Need exactly one image for view_{angle:03d}; found {len(matches)} in {INPUT_DIR}")
+    return matches[0]
+
+
+source_paths = [resolve_view(angle) for angle in (0, 90, 180, 270)]
+print("Preview source views before reconstruction/refinement:")
+for angle, path in zip((0, 90, 180, 270), source_paths):
+    print(f"  {angle:03d}° -> {path}")
+
+preview_size = 320
+preview = Image.new("RGB", (preview_size * 2, (preview_size + 28) * 2), "white")
+for index, (angle, path) in enumerate(zip((0, 90, 180, 270), source_paths)):
+    image = ImageOps.contain(Image.open(path).convert("RGB"), (preview_size, preview_size))
+    tile = Image.new("RGB", (preview_size, preview_size), "white")
+    tile.paste(image, ((preview_size - image.width) // 2, (preview_size - image.height) // 2))
+    x = (index % 2) * preview_size
+    y = (index // 2) * (preview_size + 28)
+    preview.paste(tile, (x, y))
+    ImageDraw.Draw(preview).text((x + 8, y + preview_size + 6), f"view_{angle:03d}", fill="black")
+display(preview)
+
+# Stage A. Validates all four real images before downloading/compiling LGM,
+# then runs direct Gaussian refinement.
 # First run automatically installs LGM quietly and downloads its public weights.
 subprocess.run(
     [
