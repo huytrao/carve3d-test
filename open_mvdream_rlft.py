@@ -114,6 +114,16 @@ def parse_args() -> argparse.Namespace:
             "reducing this makes ranking faster but noisier."
         ),
     )
+    parser.add_argument(
+        "--curation-prefilter-count",
+        type=int,
+        default=0,
+        help=(
+            "T4 successive curation: score every candidate once, retain this many, then collect enough extra "
+            "outputs to reach --curation-samples-per-prompt for the shortlist. Zero applies the paper's full "
+            "multi-sample pass to every candidate."
+        ),
+    )
     parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--eta", type=float, default=1.0, help="Stochastic DDIM eta; non-zero is required for policy log probabilities.")
@@ -157,6 +167,14 @@ def parse_args() -> argparse.Namespace:
             "The paper uses an approximately three-epoch window."
         ),
     )
+    parser.add_argument(
+        "--paper-stat-warmup",
+        action="store_true",
+        help=(
+            "Use epoch 1 only to fill per-prompt reward/KL statistics and perform no optimizer update, matching "
+            "the released Carve3D trainer. --epochs then includes this warmup epoch."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--elevation", type=float, default=0.0)
     parser.add_argument("--diffusion-device", type=int, default=0)
@@ -187,6 +205,26 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Fixed seeds evaluated per held-out prompt. Use at least 2 for less noisy T4 checkpoint selection.",
     )
+    parser.add_argument(
+        "--test-prompt",
+        action="append",
+        dest="test_prompts",
+        help=(
+            "Optional paper-protocol held-out test prompt. Repeat for the complete DreamFusion set; these prompts "
+            "are evaluated before and after RL with identical seeds and never select a checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--test-prompt-file",
+        type=Path,
+        help="Optional UTF-8 file with one held-out paper-protocol test prompt per non-empty line.",
+    )
+    parser.add_argument(
+        "--test-samples-per-prompt",
+        type=int,
+        default=4,
+        help="Independent same-seed outputs per optional test prompt; the paper reports 4.",
+    )
     parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
     parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
     parser.add_argument(
@@ -210,6 +248,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Stop and restore the best safe checkpoint when fixed-seed validation KL to the base policy reaches this value. "
             "The paper reports 3.2e-4 for Instant3D; that absolute value is architecture-dependent for MVDream."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-selection",
+        choices=("paper_last_safe", "best_validation"),
+        default="best_validation",
+        help=(
+            "paper_last_safe restores the latest validated policy below the KL threshold; best_validation restores "
+            "the lowest held-out MRC checkpoint as a small-compute diagnostic safeguard."
         ),
     )
     parser.add_argument(
@@ -902,7 +949,7 @@ def save_lora(unet: Any, destination: Path) -> dict[str, Any]:
 
 
 def restore_lora(unet: Any, state: dict[str, Any]) -> None:
-    """Restore the validation-best LoRA weights before final generation."""
+    """Restore a selected best-validation or paper-last-safe LoRA state."""
 
     parameters = dict(unet.named_parameters())
     for name, value in state.items():
@@ -916,6 +963,33 @@ def write_training_progress(destination: Path, **progress: Any) -> None:
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+
+
+def aggregate_prompt_evaluation_records(
+    prompts: Sequence[str], records: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Aggregate arbitrary fixed-seed records by prompt in a stable order."""
+
+    prompt_records: list[dict[str, Any]] = []
+    for prompt_index, prompt in enumerate(prompts):
+        samples = [dict(record) for record in records if record["prompt"] == prompt]
+        if not samples:
+            raise ValueError(f"No evaluation samples were recorded for prompt: {prompt}")
+        samples.sort(key=lambda record: record["seed"])
+        for sample_index, record in enumerate(samples):
+            record["prompt_index"] = prompt_index
+            record["sample_index"] = sample_index
+        prompt_records.append(
+            {
+                "prompt_index": prompt_index,
+                "prompt": prompt,
+                "mean_mrc": float(np.mean([record["mrc"] for record in samples])),
+                "std_mrc": float(np.std([record["mrc"] for record in samples])),
+                "mean_kl_to_base": float(np.mean([record["kl_to_base"] for record in samples])),
+                "samples": samples,
+            }
+        )
+    return prompt_records
 
 
 def evaluate_prompts(
@@ -999,19 +1073,7 @@ def evaluate_prompts(
             finish_score(*pending_scores.pop(0))
 
     records.sort(key=lambda record: (record["prompt_index"], record["sample_index"]))
-    prompt_records: list[dict[str, Any]] = []
-    for prompt_index, prompt in enumerate(prompts):
-        prompt_samples = [record for record in records if record["prompt_index"] == prompt_index]
-        prompt_records.append(
-            {
-                "prompt_index": prompt_index,
-                "prompt": prompt,
-                "mean_mrc": float(np.mean([record["mrc"] for record in prompt_samples])),
-                "std_mrc": float(np.std([record["mrc"] for record in prompt_samples])),
-                "mean_kl_to_base": float(np.mean([record["kl_to_base"] for record in prompt_samples])),
-                "samples": prompt_samples,
-            }
-        )
+    prompt_records = aggregate_prompt_evaluation_records(prompts, records)
     mean_mrc = float(np.mean([record["mrc"] for record in records]))
     mean_kl_to_base = float(np.mean([record["kl_to_base"] for record in records]))
     result = {
@@ -1099,6 +1161,8 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1")
+    if args.paper_stat_warmup and args.epochs < 2:
+        raise ValueError("--paper-stat-warmup requires --epochs to be at least 2")
     if args.samples_per_epoch < 2:
         raise ValueError("--samples-per-epoch must be at least 2 so RL can compute a reward advantage")
     if args.prompts_per_update < 1:
@@ -1107,6 +1171,8 @@ def main() -> None:
         raise ValueError("--curate-prompt-count cannot be negative")
     if args.curation_samples_per_prompt < 1:
         raise ValueError("--curation-samples-per-prompt must be at least 1")
+    if args.curation_prefilter_count < 0:
+        raise ValueError("--curation-prefilter-count cannot be negative")
     if args.samples_per_epoch % args.prompts_per_update != 0:
         raise ValueError("--samples-per-epoch must divide evenly by --prompts-per-update")
     samples_per_prompt = args.samples_per_epoch // args.prompts_per_update
@@ -1118,6 +1184,8 @@ def main() -> None:
         raise ValueError("--validation-every and --early-stop-patience must be at least 1")
     if args.validation_samples_per_prompt < 1:
         raise ValueError("--validation-samples-per-prompt must be at least 1")
+    if args.test_samples_per_prompt < 1:
+        raise ValueError("--test-samples-per-prompt must be at least 1")
     if args.min_validation_improvement < 0:
         raise ValueError("--min-validation-improvement cannot be negative")
     if args.advantage_clip <= 0:
@@ -1131,6 +1199,17 @@ def main() -> None:
     prompt_configuration = resolve_prompt_configuration(args)
     prompts = prompt_configuration.training
     validation_prompts = prompt_configuration.validation
+    test_prompts = _nonempty_prompts(args.test_prompts, "--test-prompt")
+    if args.test_prompt_file is not None:
+        if not args.test_prompt_file.is_file():
+            raise FileNotFoundError(f"Test prompt file does not exist: {args.test_prompt_file}")
+        file_prompts = [
+            line.strip()
+            for line in args.test_prompt_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        test_prompts.extend(_nonempty_prompts(file_prompts, "--test-prompt-file"))
+    test_prompts = list(dict.fromkeys(test_prompts))
     # Downstream final-candidate helpers consume the resolved value from args.
     args.final_prompt = prompt_configuration.final
     print("Resolved RLFT prompts (these condition MVDream; they are not captions read from input images):")
@@ -1138,6 +1217,8 @@ def main() -> None:
         print(f"  train {index}: {prompt}")
     for index, prompt in enumerate(validation_prompts, start=1):
         print(f"  validation {index}: {prompt}")
+    if test_prompts:
+        print(f"  paper-protocol test prompts: {len(test_prompts)} x {args.test_samples_per_prompt} samples")
     print(f"  final: {args.final_prompt}", flush=True)
 
     diffusion_device, _ = _check_devices(args.diffusion_device, args.lgm_device)
@@ -1165,34 +1246,97 @@ def main() -> None:
             raise ValueError("--curate-prompt-count must be at least --prompts-per-update")
         if args.curate_prompt_count > len(curation_candidates):
             raise ValueError("--curate-prompt-count cannot exceed the number of distinct training prompts")
+        if args.curation_prefilter_count and args.curation_prefilter_count < args.curate_prompt_count:
+            raise ValueError("--curation-prefilter-count must be at least --curate-prompt-count")
+        if args.curation_prefilter_count > len(curation_candidates):
+            raise ValueError("--curation-prefilter-count cannot exceed the number of curation candidates")
         print(
             f"[Curation] scoring {len(curation_candidates)} base-policy prompts; selecting "
             f"{args.curate_prompt_count} with highest mean MRC over "
             f"{args.curation_samples_per_prompt} samples/prompt...",
             flush=True,
         )
-        curation_evaluation = evaluate_prompts(
-            pipe,
-            curation_candidates,
-            scorer,
-            args.output_dir / "curation" / "base_policy",
-            args.seed + 2_000_000,
-            diffusion_device,
-            args,
-            samples_per_prompt=args.curation_samples_per_prompt,
-            label="Curation",
-        )
-        ranked = sorted(
-            curation_evaluation["prompt_records"],
-            key=lambda record: record["mean_mrc"],
-            reverse=True,
-        )
+        prefilter_evaluation: dict[str, Any] | None = None
+        if args.curation_prefilter_count and args.curation_prefilter_count < len(curation_candidates):
+            print(
+                f"[Curation] T4 successive pass: 1 sample for all candidates, then "
+                f"{args.curation_samples_per_prompt - 1} additional sample(s) for the top "
+                f"{args.curation_prefilter_count}.",
+                flush=True,
+            )
+            prefilter_evaluation = evaluate_prompts(
+                pipe,
+                curation_candidates,
+                scorer,
+                args.output_dir / "curation" / "prefilter_all_candidates",
+                args.seed + 2_000_000,
+                diffusion_device,
+                args,
+                samples_per_prompt=1,
+                label="Curation prefilter",
+            )
+            prefilter_ranked = sorted(
+                prefilter_evaluation["prompt_records"],
+                key=lambda record: record["mean_mrc"],
+                reverse=True,
+            )
+            ranking_candidates = [
+                record["prompt"] for record in prefilter_ranked[: args.curation_prefilter_count]
+            ]
+            combined_records = [
+                record
+                for record in prefilter_evaluation["records"]
+                if record["prompt"] in ranking_candidates
+            ]
+            additional_samples = args.curation_samples_per_prompt - 1
+            if additional_samples > 0:
+                additional_evaluation = evaluate_prompts(
+                    pipe,
+                    ranking_candidates,
+                    scorer,
+                    args.output_dir / "curation" / "shortlist_additional_samples",
+                    args.seed + 2_500_000,
+                    diffusion_device,
+                    args,
+                    samples_per_prompt=additional_samples,
+                    label="Curation shortlist",
+                )
+                combined_records.extend(additional_evaluation["records"])
+            final_prompt_records = aggregate_prompt_evaluation_records(
+                ranking_candidates,
+                combined_records,
+            )
+            curation_mode = "T4 successive prefilter"
+        else:
+            curation_evaluation = evaluate_prompts(
+                pipe,
+                curation_candidates,
+                scorer,
+                args.output_dir / "curation" / "base_policy",
+                args.seed + 2_000_000,
+                diffusion_device,
+                args,
+                samples_per_prompt=args.curation_samples_per_prompt,
+                label="Curation",
+            )
+            final_prompt_records = curation_evaluation["prompt_records"]
+            curation_mode = "paper full multi-sample ranking"
+        ranked = sorted(final_prompt_records, key=lambda record: record["mean_mrc"], reverse=True)
         prompts = [record["prompt"] for record in ranked[: args.curate_prompt_count]]
         curation = {
             "enabled": True,
+            "mode": curation_mode,
             "criterion": "highest base-policy mean MRC over independent outputs (lowest mean reward)",
-            "samples_per_candidate": args.curation_samples_per_prompt,
-            "candidates": curation_evaluation["prompt_records"],
+            "samples_per_candidate": (
+                args.curation_samples_per_prompt if prefilter_evaluation is None else None
+            ),
+            "prefilter_samples_per_candidate": 1 if prefilter_evaluation is not None else None,
+            "final_ranking_samples_per_candidate": args.curation_samples_per_prompt,
+            "prefilter_count": args.curation_prefilter_count,
+            "prefilter_candidates": (
+                prefilter_evaluation["prompt_records"] if prefilter_evaluation is not None else None
+            ),
+            "candidates": final_prompt_records,
             "selected": list(prompts),
         }
         for index, record in enumerate(ranked, start=1):
@@ -1202,9 +1346,13 @@ def main() -> None:
                 f"std={record['std_mrc']:.6f} ({marker}) {record['prompt']}",
                 flush=True,
             )
+    warmup_epoch_count = 1 if args.paper_stat_warmup else 0
+    training_updates = args.epochs - warmup_epoch_count
+    if training_updates < 1:
+        raise ValueError("--paper-stat-warmup requires --epochs to be at least 2")
     prompt_batches = balanced_prompt_batches(
         prompts,
-        args.epochs,
+        training_updates,
         args.prompts_per_update,
         args.seed + 17_003,
     )
@@ -1242,10 +1390,26 @@ def main() -> None:
         publish_best=False,
         label="Baseline final",
     )
+    baseline_test_evaluation = None
+    if test_prompts:
+        baseline_test_evaluation = evaluate_prompts(
+            pipe,
+            test_prompts,
+            scorer,
+            args.output_dir / "paper_test" / "baseline",
+            args.seed + 4_000_000,
+            diffusion_device,
+            args,
+            samples_per_prompt=args.test_samples_per_prompt,
+            label="Paper test baseline",
+        )
     best_validation_mrc = baseline_validation["mean_mrc"]
     best_epoch = -1
     best_state = lora_state(pipe.unet)
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
+    last_safe_epoch = -1
+    last_safe_state = lora_state(pipe.unet)
+    save_lora(pipe.unet, args.output_dir / "checkpoints" / "last_safe_lora.pt")
     validations_without_improvement = 0
     training_stop_reason = "max_epochs"
     progress_file = args.output_dir / "training_progress.json"
@@ -1265,7 +1429,48 @@ def main() -> None:
         flush=True,
     )
 
-    for epoch in range(args.epochs):
+    statistics_warmup: dict[str, Any] = {"enabled": False}
+    if args.paper_stat_warmup:
+        print(
+            f"[RL 1/{args.epochs}] paper statistics warmup: "
+            f"{samples_per_prompt} trajectories for each of {len(prompts)} selected prompts; no optimizer update.",
+            flush=True,
+        )
+        warmup_evaluation = evaluate_prompts(
+            pipe,
+            prompts,
+            scorer,
+            args.output_dir / "statistics_warmup",
+            args.seed + 3_000_000,
+            diffusion_device,
+            args,
+            samples_per_prompt=samples_per_prompt,
+            label="Statistics warmup",
+        )
+        warmup_rewards = [-float(record["mrc"]) for record in warmup_evaluation["records"]]
+        warmup_kls = [float(record["kl_to_base"]) for record in warmup_evaluation["records"]]
+        warmup_group_ids = [record["prompt"] for record in warmup_evaluation["records"]]
+        reward_stat_tracker.update(warmup_rewards, warmup_group_ids)
+        kl_stat_tracker.update(warmup_kls, warmup_group_ids)
+        statistics_warmup = {
+            "enabled": True,
+            "paper_epoch": 1,
+            "optimizer_update": False,
+            "samples_per_prompt": samples_per_prompt,
+            "evaluation": warmup_evaluation,
+        }
+        write_training_progress(
+            progress_file,
+            status="running",
+            stage="statistics_warmup_complete",
+            current_epoch=1,
+            total_epochs=args.epochs,
+            best_epoch=best_epoch,
+            best_validation_mrc=best_validation_mrc,
+        )
+
+    for update_index in range(training_updates):
+        epoch = update_index + warmup_epoch_count
         # In transactional mode the validation score is a hard trust-region
         # gate.  Snapshot AdamW as well as LoRA tensors: restoring only LoRA
         # would retain stale Adam moments and still push the next update in the
@@ -1276,7 +1481,7 @@ def main() -> None:
         # Mix several prompts per update, but normalize reward/KL within each
         # prompt as Carve3D/DDPO requires. Cycling prompts across updates means
         # an object category is revisited instead of receiving one update only.
-        epoch_prompts = prompt_batches[epoch]
+        epoch_prompts = prompt_batches[update_index]
         print(
             f"[RL {epoch + 1}/{args.epochs}] sampling {args.samples_per_epoch} trajectories "
             f"across {args.prompts_per_update} prompt(s)",
@@ -1358,6 +1563,39 @@ def main() -> None:
 
         rewards = np.asarray([trajectory.reward for trajectory in trajectories], dtype=np.float32)
         kl_values = np.asarray([trajectory.kl_to_base for trajectory in trajectories], dtype=np.float32)
+        sampled_mean_kl = float(kl_values.mean())
+        sampled_kl_limit_reached = (
+            args.kl_early_stop_threshold is not None
+            and sampled_mean_kl >= args.kl_early_stop_threshold
+        )
+        if sampled_kl_limit_reached:
+            training_stop_reason = "sampled_training_kl_threshold"
+            print(
+                f"[RL] paper-style KL early stopping before optimizer update: sampled KL_base="
+                f"{sampled_mean_kl:.6f} reached threshold={args.kl_early_stop_threshold:.6f}. "
+                "The sampled batch is discarded and the last safe LoRA will be restored.",
+                flush=True,
+            )
+            write_training_progress(
+                progress_file,
+                status="early_stopped",
+                stage="training_complete",
+                reason="sampled_training_kl_threshold",
+                current_epoch=epoch + 1,
+                total_epochs=args.epochs,
+                sampled_training_kl_to_base=sampled_mean_kl,
+                last_safe_epoch=last_safe_epoch,
+                best_validation_mrc=best_validation_mrc,
+            )
+            break
+        # The current sampling policy is explicitly below the KL limit. Save
+        # it before applying the next update, mirroring epoch-wise KL logging in
+        # the released trainer and avoiding a five-validation-epoch blind spot.
+        last_safe_epoch = epoch - 1
+        last_safe_state = save_lora(
+            pipe.unet,
+            args.output_dir / "checkpoints" / "last_safe_lora.pt",
+        )
         group_ids = [trajectory.prompt for trajectory in trajectories]
         # Paper Eqs. (6), (9), and Appendix C.2: normalize reward and base-KL
         # separately per prompt using a running window of roughly three prompt
@@ -1451,6 +1689,13 @@ def main() -> None:
                     validation_kl_to_base=validation["mean_kl_to_base"],
                 )
                 break
+            # This is the latest checkpoint that has been explicitly measured
+            # below the paper KL threshold, regardless of validation-MRC noise.
+            last_safe_epoch = epoch
+            last_safe_state = save_lora(
+                pipe.unet,
+                args.output_dir / "checkpoints" / "last_safe_lora.pt",
+            )
             validation_improvement = best_validation_mrc - validation["mean_mrc"]
             epoch_record["validation_improvement"] = validation_improvement
             improved = validation_improvement >= args.min_validation_improvement
@@ -1514,7 +1759,17 @@ def main() -> None:
             best_validation_mrc=best_validation_mrc,
         )
 
-    restore_lora(pipe.unet, best_state)
+    if args.checkpoint_selection == "paper_last_safe":
+        selected_state = last_safe_state
+        selected_epoch = last_safe_epoch
+    else:
+        selected_state = best_state
+        selected_epoch = best_epoch
+    restore_lora(pipe.unet, selected_state)
+    print(
+        f"[Checkpoint] selection={args.checkpoint_selection} epoch={selected_epoch + 1 if selected_epoch >= 0 else 0}",
+        flush=True,
+    )
     pipe.unet.eval()
     final_selection = evaluate_final_candidates(pipe, scorer, diffusion_device, args)
     final_selection["paired_mean_mrc_improvement"] = (
@@ -1531,11 +1786,75 @@ def main() -> None:
         f"improvement={final_selection['paired_mean_mrc_improvement']:.6f}",
         flush=True,
     )
+    paper_test_evaluation = None
+    if test_prompts:
+        post_test_evaluation = evaluate_prompts(
+            pipe,
+            test_prompts,
+            scorer,
+            args.output_dir / "paper_test" / "post_rl",
+            args.seed + 4_000_000,
+            diffusion_device,
+            args,
+            samples_per_prompt=args.test_samples_per_prompt,
+            label="Paper test post-RL",
+        )
+        assert baseline_test_evaluation is not None
+        paper_test_evaluation = {
+            "prompt_count": len(test_prompts),
+            "samples_per_prompt": args.test_samples_per_prompt,
+            "baseline": baseline_test_evaluation,
+            "post_rl": post_test_evaluation,
+            "paired_mean_mrc_improvement": (
+                baseline_test_evaluation["mean_mrc"] - post_test_evaluation["mean_mrc"]
+            ),
+        }
+        print(
+            f"[Paper test comparison] same-seed mean MRC: base={baseline_test_evaluation['mean_mrc']:.6f} "
+            f"post_RL={post_test_evaluation['mean_mrc']:.6f} "
+            f"improvement={paper_test_evaluation['paired_mean_mrc_improvement']:.6f}",
+            flush=True,
+        )
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "lora_final.pt")
     metadata = {
         "pipeline": "open-mvdream-lgm-mrc-on-policy-lora-rlft",
         "not_exact_carve3d": True,
         "reason": "The released Carve3D code and paper state that Instant3D and sparse-view LRM are unavailable.",
+        "paper_parity": {
+            "exact_algorithmic_matches": {
+                "objective": "pure on-policy score-function/REINFORCE; one optimizer update per sampled batch",
+                "reward": "negative foreground-bbox AlexNet LPIPS MRC",
+                "advantages": "per-prompt normalized reward minus 0.2 times per-prompt normalized base KL",
+                "diffusion": "stochastic DDIM eta=1, CFG=5, all denoising timesteps",
+                "finetuning": "rank-4 fp32 attention LoRA over a frozen fp16 base",
+                "optimizer": "AdamW betas=(0.9,0.999), eps=1e-8, weight_decay=1e-4",
+                "curation": "four outputs determine the final mean-MRC rank for every shortlisted prompt",
+                "warmup": "first paper epoch fills prompt statistics and performs no optimizer update",
+            },
+            "t4_scaled_differences": {
+                "candidate_ranking": (
+                    "100x1 prefilter then 30x3 additional samples; paper scores all 100 four times"
+                    if args.curation_prefilter_count
+                    else "full four-output curation"
+                ),
+                "selected_prompt_count": len(prompts),
+                "batch": args.samples_per_epoch,
+                "learning_rate": args.learning_rate,
+                "denoising_steps": args.num_steps,
+                "validation_prompt_count": len(validation_prompts),
+                "validation_samples_per_prompt": args.validation_samples_per_prompt,
+            },
+            "unavailable_substitutions": {
+                "policy": "public MVDream SD2.1 replaces unreleased Instant3D-10K SDXL",
+                "reconstructor": "public LGM Gaussian model replaces unreleased sparse-view NeRF LRM",
+                "training_prompts": "Appendix-C.1 recipe recreation replaces the unreleased exact prompt strings",
+                "paper_test_set": (
+                    f"optional protocol executed on {len(test_prompts)} supplied prompts"
+                    if test_prompts
+                    else "the 415-prompt x4 evaluation was not requested for this T4 run"
+                ),
+            },
+        },
         "mvdream_checkpoint": MVDREAM_CHECKPOINT,
         "lgm_checkpoint_url": LGM_CHECKPOINT_URL,
         "mvdream_to_lgm_order": list(MVDREAM_TO_LGM),
@@ -1546,6 +1865,8 @@ def main() -> None:
             "kl_coeff": args.kl_coeff,
             "kl_reference": "frozen base MVDream with LoRA disabled on every sampled transition",
             "epochs": args.epochs,
+            "optimizer_updates_requested": training_updates,
+            "statistics_warmup": statistics_warmup,
             "samples_per_epoch": args.samples_per_epoch,
             "prompts_per_update": args.prompts_per_update,
             "prompt_curation": curation,
@@ -1571,6 +1892,7 @@ def main() -> None:
             "early_stop_patience": args.early_stop_patience,
             "kl_early_stop_threshold": args.kl_early_stop_threshold,
             "min_validation_improvement": args.min_validation_improvement,
+            "checkpoint_selection": args.checkpoint_selection,
             "learning_rate": args.learning_rate,
             "adamw": {"betas": [0.9, 0.999], "epsilon": 1e-8, "weight_decay": 1e-4},
             "transactional_validation": args.transactional_validation,
@@ -1587,8 +1909,11 @@ def main() -> None:
         },
         "baseline_validation": baseline_validation,
         "baseline_final_selection": baseline_final_selection,
+        "paper_test_evaluation": paper_test_evaluation,
         "best_validation_mrc": best_validation_mrc,
         "best_epoch": best_epoch,
+        "last_safe_epoch": last_safe_epoch,
+        "selected_checkpoint_epoch": selected_epoch,
         "training_stop_reason": training_stop_reason,
         "history": history,
         "final_evaluation": final_selection,
@@ -1598,9 +1923,10 @@ def main() -> None:
         progress_file,
         status="completed",
         stage="final_evaluation_complete",
-        current_epoch=len(history),
+        current_epoch=len(history) + warmup_epoch_count,
         total_epochs=args.epochs,
         best_epoch=best_epoch,
+        selected_checkpoint_epoch=selected_epoch,
         best_validation_mrc=best_validation_mrc,
         final_mrc=final_selection["selected"]["mrc"],
         final_mean_mrc=final_selection["mean_mrc"],

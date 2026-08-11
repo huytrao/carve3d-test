@@ -207,10 +207,11 @@ public MVDream -> 4 generated views -> public LGM -> bbox LPIPS MRC reward
 When enabled, it assigns MVDream/RL to GPU 0 and LGM/MRC to GPU 1 on Kaggle T4
 x2. RLFT now requires an explicit `--target-prompt` or `--prompt`; it never
 silently substitutes chair/teapot demo categories. The one-cell quality
-profile uses at most 30 small updates, eight same-prompt trajectories per
-update, a 30-candidate/four-samples-each low-reward curation pass, persistent
-three-appearance per-prompt statistics, multi-seed held-out validation,
-paper-style KL early stopping, and overlapped work across both T4s. The exact
+profile uses 55 paper epochs (one no-update stat warmup plus at most 54
+updates), eight same-prompt trajectories per update, successive curation of 100
+candidates with four-output final ranking, persistent three-appearance
+per-prompt statistics, multi-seed held-out monitoring, paper-style last-safe KL
+stopping, and overlapped work across both T4s. The exact
 author prompt dataset remains unreleased, so the transparent Appendix-C.1-style
 replacement lives in `prompt_sets/paper_style_t4.json`.
 It remains vastly below the paper's batch-768, 55-epoch training on 48 A100

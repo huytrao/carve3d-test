@@ -43,18 +43,20 @@ policy-gradient replay requires the DDIM states, actions, and log probabilities
 that produced each sample.
 
 When its RLFT switch is enabled, `code.txt` uses the paper-style T4 x2 profile:
-at most 30 updates, one prompt per update, eight stochastic trajectories for
-that prompt, and the official public MVDream/LGM setting of 30 DDIM steps. The
-Appendix-C.1 pass scores 30 recreated "complex but not too creative" candidates
-with four base-policy outputs each and retains the ten highest-mean-MRC
-(lowest-reward) prompts. The exact author dataset is not public; the replacement
-and its provenance are explicit in `prompt_sets/paper_style_t4.json`.
+55 paper epochs, with epoch 1 reserved for statistic warmup and no optimizer
+step, followed by at most 54 pure on-policy updates. Each update uses one prompt
+and eight stochastic trajectories. The public MVDream/LGM setting remains 30
+DDIM steps. The Appendix-C.1 recreation contains 100 "complex but not too
+creative" candidates. T4 successive curation scores all 100 once, gives the
+hardest 30 three more outputs, and retains ten prompts by four-output mean MRC.
+The exact author dataset is not public; provenance is explicit in
+`prompt_sets/paper_style_t4.json`.
 
 Timestep losses are averaged so their scale does not grow with the step count.
 Reward and KL normalization retain a three-appearance per-prompt window. Two
-fixed seeds across four held-out prompts select the best LoRA; paper-style KL
-and validation-plateau early stopping replace the former per-update
-transactional rollback. The final report evaluates the base and best LoRA on
+fixed seeds across four held-out prompts monitor the policy; MRC plateau
+stopping is disabled and the latest checkpoint below the paper KL threshold is
+restored. The final report evaluates the base and last-safe LoRA on
 the same four seeds, reports their paired mean-MRC change, and separately saves
 the lowest-MRC candidate as an inference-time selection.
 

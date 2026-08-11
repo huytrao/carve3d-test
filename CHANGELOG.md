@@ -115,6 +115,20 @@ All material pipeline changes are recorded here.
 - Validate four held-out prompts with two fixed seeds each and compare base
   versus best-LoRA final MRC on the same four seeds. The paired mean is reported
   separately from inference-time best-of-four selection.
+- Expand the Appendix-C.1 recreation to 100 unique candidates. Add a T4
+  successive curation mode (`100×1`, then three additional samples for the
+  hardest 30) and retain full `100×4` ranking through
+  `--curation-prefilter-count 0` when compute permits.
+- Match the released trainer's first-epoch control flow with
+  `--paper-stat-warmup`: populate every selected prompt's reward/KL tracker and
+  perform no optimizer update. The one-cell profile now counts 55 paper epochs,
+  with at most 54 on-policy updates.
+- Add `paper_last_safe` checkpoint selection and disable non-paper MRC plateau
+  stopping in the one-cell profile. Training stops on KL and restores the most
+  recent policy explicitly measured below the KL threshold.
+- Add an optional same-seed, four-output test protocol through repeatable
+  `--test-prompt` or `--test-prompt-file`, and serialize a machine-readable
+  paper-parity audit in every `rlft_metrics.json`.
 - Pipeline GPU-0 MVDream sampling with GPU-1 LGM/MRC scoring through
   `--overlap-reward`, increasing dual-T4 utilization without changing the
   sampled trajectories or on-policy objective.

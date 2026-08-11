@@ -8,6 +8,7 @@ from unittest.mock import patch
 from open_mvdream_rlft import (
     MVDREAM_TO_LGM,
     PerPromptRunningNormalizer,
+    aggregate_prompt_evaluation_records,
     balanced_prompt_batches,
     grouped_normalized_advantages,
     parse_args,
@@ -71,15 +72,21 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertEqual(args.prompts_per_update, 1)
         self.assertEqual(args.curate_prompt_count, 0)
         self.assertEqual(args.curation_samples_per_prompt, 4)
+        self.assertEqual(args.curation_prefilter_count, 0)
         self.assertEqual(args.kl_coeff, 0.2)
         self.assertEqual(args.timestep_loss_reduction, "mean")
         self.assertEqual(args.advantage_clip, 5.0)
         self.assertEqual(args.stat_buffer_epochs, 3)
         self.assertEqual(args.validation_samples_per_prompt, 1)
+        self.assertEqual(args.test_samples_per_prompt, 4)
+        self.assertIsNone(args.test_prompts)
+        self.assertIsNone(args.test_prompt_file)
         self.assertEqual(args.min_validation_improvement, 1e-4)
         self.assertEqual(args.final_candidates, 1)
         self.assertIsNone(args.kl_early_stop_threshold)
+        self.assertEqual(args.checkpoint_selection, "best_validation")
         self.assertFalse(args.overlap_reward)
+        self.assertFalse(args.paper_stat_warmup)
         self.assertIsNone(args.target_prompt)
         self.assertIsNone(args.final_prompt)
         self.assertFalse(args.transactional_validation)
@@ -117,10 +124,21 @@ class OpenRlftHelpersTest(unittest.TestCase):
         prompt_set_path = Path(__file__).parents[1] / "prompt_sets" / "paper_style_t4.json"
         prompt_set = json.loads(prompt_set_path.read_text(encoding="utf-8"))
         candidates = prompt_set["training_candidates"]
-        self.assertEqual(len(candidates), 30)
-        self.assertEqual(len(set(candidates)), 30)
+        self.assertEqual(len(candidates), 100)
+        self.assertEqual(len(set(candidates)), 100)
         self.assertNotIn(prompt_set["final_prompt"], candidates)
         self.assertEqual(len(prompt_set["validation_prompts"]), 4)
+
+    def test_prompt_evaluation_aggregation_combines_successive_curation_passes(self):
+        records = [
+            {"prompt": "hard", "seed": 4, "mrc": 0.4, "kl_to_base": 0.0},
+            {"prompt": "easy", "seed": 2, "mrc": 0.1, "kl_to_base": 0.0},
+            {"prompt": "hard", "seed": 3, "mrc": 0.2, "kl_to_base": 0.0},
+        ]
+        aggregated = aggregate_prompt_evaluation_records(["hard", "easy"], records)
+        self.assertAlmostEqual(aggregated[0]["mean_mrc"], 0.3)
+        self.assertEqual([sample["seed"] for sample in aggregated[0]["samples"]], [3, 4])
+        self.assertAlmostEqual(aggregated[1]["mean_mrc"], 0.1)
 
 
 if __name__ == "__main__":
