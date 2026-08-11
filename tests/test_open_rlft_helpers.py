@@ -23,8 +23,10 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertEqual(args.epochs, 16)
         self.assertEqual(args.num_steps, 30)
         self.assertEqual(args.lora_rank, 4)
-        self.assertEqual(args.learning_rate, 3e-4)
+        self.assertEqual(args.learning_rate, 1e-5)
         self.assertEqual(args.kl_coeff, 0.2)
+        self.assertEqual(args.final_candidates, 1)
+        self.assertFalse(args.transactional_validation)
 
 
 if __name__ == "__main__":

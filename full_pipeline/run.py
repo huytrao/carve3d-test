@@ -66,6 +66,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None, help="LGM model_fp16_fixrot.safetensors. Defaults to <lgm-root>/pretrained/.")
     parser.add_argument("--preset", choices=("big", "small"), default="big", help="LGM architecture. The published fp16_fixrot checkpoint requires 'big'.")
     parser.add_argument("--elevation", type=float, default=0.0, help="Common elevation in degrees for all four input cameras.")
+    parser.add_argument(
+        "--elevation-candidates",
+        nargs="+",
+        type=float,
+        default=None,
+        help=(
+            "For four real photographs, reconstruct at every listed common elevation and keep the lowest "
+            "same-pose MRC. Example: --elevation-candidates -10 -5 0 5 10."
+        ),
+    )
     parser.add_argument("--render-size", type=int, default=512, help="Output render edge length; 256 lowers GPU use.")
     parser.add_argument("--mrc-metric", choices=("lpips", "l1"), default="lpips", help="LPIPS is Carve3D MRC; L1 is only a dependency-light smoke-test metric.")
     parser.add_argument("--lgm-device", type=int, default=0, help="CUDA device used for LGM reconstruction, rendering and MRC.")
@@ -261,6 +271,8 @@ def main() -> None:
     )
 
     if args.prompt:
+        if args.elevation_candidates and len(args.elevation_candidates) > 1:
+            raise ValueError("--elevation-candidates is for real four-view input, not --prompt mode.")
         if not 0 <= args.prompt_device < torch.cuda.device_count():
             raise RuntimeError(
                 f"--prompt-device {args.prompt_device} is unavailable; detected {torch.cuda.device_count()} CUDA device(s)."
@@ -293,12 +305,54 @@ def main() -> None:
     mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
     std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
     normalized.sub_(mean).div_(std)
-    rays = model.prepare_default_rays(device, elevation=args.elevation)
-    lgm_input = torch.cat((normalized, rays), dim=1).unsqueeze(0)
+    # A turntable/capture rig often sits a few degrees above or below the
+    # horizontal LGM convention.  The former one-shot path hard-coded 0° and
+    # therefore made a correct object look inconsistent simply because its
+    # cameras were mis-specified.  Search only for real supplied views; prompt
+    # images already use the exact elevation passed to MVDream.
+    elevations = args.elevation_candidates or [args.elevation]
+    if args.prompt:
+        elevations = [args.elevation]
 
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        gaussians = model.forward_gaussians(lgm_input)
-        rendered_tensor = _render_views(model, opt, device, gaussians, ANGLES, args.elevation)
+    # Import here so --help and input-layout validation remain lightweight.
+    from full_pipeline.mrc import _lpips_model, compute_mrc
+
+    lpips_model = _lpips_model(device) if args.mrc_metric == "lpips" else None
+    candidates = []
+    for candidate_elevation in elevations:
+        rays = model.prepare_default_rays(device, elevation=candidate_elevation)
+        lgm_input = torch.cat((normalized, rays), dim=1).unsqueeze(0)
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+            candidate_gaussians = model.forward_gaussians(lgm_input)
+            candidate_rendered = _render_views(model, opt, device, candidate_gaussians, ANGLES, candidate_elevation)
+        resized_inputs = F.interpolate(
+            input_tensor, size=candidate_rendered.shape[-2:], mode="bilinear", align_corners=False
+        )
+        candidate_mrc, _ = compute_mrc(
+            resized_inputs,
+            candidate_rendered,
+            ANGLES,
+            metric=args.mrc_metric,
+            lpips_model=lpips_model,
+        )
+        candidates.append(
+            {
+                "elevation": candidate_elevation,
+                "gaussians": candidate_gaussians,
+                "rendered": candidate_rendered,
+                "mrc": candidate_mrc,
+            }
+        )
+        print(
+            f"Elevation {candidate_elevation:+.1f}\N{DEGREE SIGN}: MRC={candidate_mrc['mrc']:.6f}",
+            flush=True,
+        )
+
+    best_candidate = min(candidates, key=lambda candidate: candidate["mrc"]["mrc"])
+    selected_elevation = best_candidate["elevation"]
+    gaussians = best_candidate["gaussians"]
+    rendered_tensor = best_candidate["rendered"]
+    mrc = best_candidate["mrc"]
     model.gs.save_ply(gaussians, args.output_dir / "reconstruction.ply")
 
     rendered_np = rendered_tensor.permute(0, 2, 3, 1).float().cpu().numpy()
@@ -306,19 +360,18 @@ def main() -> None:
         _save_image(render, args.output_dir / f"render_view_{angle:03d}.png")
     _save_image(_make_grid(list(rendered_np)), args.output_dir / "render_grid.png")
 
-    resized_inputs = F.interpolate(input_tensor, size=rendered_tensor.shape[-2:], mode="bilinear", align_corners=False)
-    # Import here so the command-line help and input-layout validation can run
-    # on a lightweight machine without the GPU PyTorch runtime installed.
-    from full_pipeline.mrc import compute_mrc
-
-    mrc, _ = compute_mrc(resized_inputs, rendered_tensor, ANGLES, metric=args.mrc_metric)
     metadata = {
         "pipeline": "LGM-four-view-adapter-for-Carve3D-MRC",
         "checkpoint": str(checkpoint),
         "checkpoint_url": LGM_CHECKPOINT_URL,
         "lgm_preset": args.preset,
         "angles_degrees": list(ANGLES),
-        "elevation_degrees": args.elevation,
+        "elevation_degrees": selected_elevation,
+        "elevation_candidates_degrees": elevations,
+        "elevation_search": [
+            {"elevation_degrees": candidate["elevation"], "mrc": candidate["mrc"]}
+            for candidate in candidates
+        ],
         "render_size": args.render_size,
         "lgm_device": args.lgm_device,
         "preprocessing": {
@@ -331,7 +384,7 @@ def main() -> None:
     (args.output_dir / "metrics.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     if args.orbit:
-        _save_orbit(model, opt, device, gaussians, args.output_dir / "orbit.mp4", args.elevation, args.orbit_frames)
+        _save_orbit(model, opt, device, gaussians, args.output_dir / "orbit.mp4", selected_elevation, args.orbit_frames)
     print(json.dumps(metadata, indent=2))
     print(f"\nCompleted. Results: {args.output_dir.resolve()}")
 

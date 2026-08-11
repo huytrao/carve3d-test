@@ -20,8 +20,10 @@ reasonable expectation for two T4s.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,12 +76,20 @@ def parse_args() -> argparse.Namespace:
         dest="prompts",
         help="One training prompt. Repeat --prompt for more. Defaults to two conservative object prompts.",
     )
-    parser.add_argument("--epochs", type=int, default=16, help="On-policy RL updates. The quality preset uses 16 on T4 x2.")
+    parser.add_argument("--epochs", type=int, default=16, help="On-policy RL updates.")
     parser.add_argument("--samples-per-epoch", type=int, default=4, help="Same-prompt trajectories per update; at least 2 are required for advantages.")
-    parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps. 30 is the practical T4 x2 quality setting.")
+    parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--eta", type=float, default=1.0, help="Stochastic DDIM eta; non-zero is required for policy log probabilities.")
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-5,
+        help=(
+            "LoRA AdamW learning rate. 1e-5 is the conservative T4 small-batch default; "
+            "the paper's 3e-4 was used with batch 768 on 48 A100s."
+        ),
+    )
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=float, default=4.0)
     parser.add_argument("--kl-coeff", type=float, default=0.2, help="Approximate KL-to-sampling-policy penalty.")
@@ -99,6 +109,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
     parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
+    parser.add_argument(
+        "--transactional-validation",
+        action="store_true",
+        help=(
+            "Validate every update and restore the pre-update LoRA/optimizer state whenever validation MRC does not improve. "
+            "Recommended for T4's small, noisy RL batches."
+        ),
+    )
+    parser.add_argument(
+        "--final-candidates",
+        type=int,
+        default=1,
+        help="Generate this many fixed-seed final samples and retain the one with lowest MRC (at least 1).",
+    )
     return parser.parse_args()
 
 
@@ -586,6 +610,64 @@ def evaluate_prompts(
     return result
 
 
+def evaluate_final_candidates(
+    pipe: Any,
+    scorer: LgmMrcScorer,
+    device: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Score final fixed-seed samples and retain the best reconstruction-consistent one.
+
+    This is deliberately reported as inference-time best-of-N selection.  It
+    does not pretend that sampling several seeds is an RL improvement or a
+    result reported by the original Carve3D paper.
+    """
+
+    if args.final_candidates < 1:
+        raise ValueError("--final-candidates must be at least 1")
+    candidates_root = args.output_dir / "final_candidates"
+    records: list[dict[str, Any]] = []
+    best_path: Path | None = None
+    best_trajectory: Trajectory | None = None
+    for index in range(args.final_candidates):
+        seed = args.seed + 100_000 + index
+        trajectory = sample_trajectory(
+            pipe,
+            args.final_prompt,
+            seed,
+            device,
+            args.num_steps,
+            args.guidance_scale,
+            args.eta,
+            args.elevation,
+        )
+        candidate_path = candidates_root / f"candidate_{index:02d}"
+        score_and_save(trajectory, scorer, candidate_path)
+        record = {"index": index, "seed": seed, "mrc": trajectory.mrc, "reward_negative_mrc": trajectory.reward}
+        records.append(record)
+        print(
+            f"[Final {index + 1}/{args.final_candidates}] MRC={trajectory.mrc:.6f}",
+            flush=True,
+        )
+        if best_trajectory is None or trajectory.mrc < best_trajectory.mrc:
+            best_trajectory = trajectory
+            best_path = candidate_path
+
+    assert best_trajectory is not None and best_path is not None
+    final_destination = args.output_dir / "final_evaluation"
+    shutil.rmtree(final_destination, ignore_errors=True)
+    shutil.copytree(best_path, final_destination)
+    result = {
+        "selection": "lowest_mrc_over_fixed_seed_candidates",
+        "candidate_count": args.final_candidates,
+        "prompt": args.final_prompt,
+        "selected": min(records, key=lambda record: record["mrc"]),
+        "candidates": records,
+    }
+    (final_destination / "selection.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 def main() -> None:
     args = parse_args()
     if args.epochs < 1:
@@ -596,6 +678,8 @@ def main() -> None:
         raise ValueError("--num-steps must be at least 2")
     if args.validation_every < 1 or args.early_stop_patience < 1:
         raise ValueError("--validation-every and --early-stop-patience must be at least 1")
+    if args.final_candidates < 1:
+        raise ValueError("--final-candidates must be at least 1")
     prompts = args.prompts or default_prompts()
     validation_prompts = args.validation_prompts or default_validation_prompts()
     if not prompts:
@@ -641,6 +725,12 @@ def main() -> None:
     print(f"[RL 0/{args.epochs}] baseline validation MRC={best_validation_mrc:.6f}", flush=True)
 
     for epoch in range(args.epochs):
+        # In transactional mode the validation score is a hard trust-region
+        # gate.  Snapshot AdamW as well as LoRA tensors: restoring only LoRA
+        # would retain stale Adam moments and still push the next update in the
+        # rejected direction.
+        pre_update_state = lora_state(pipe.unet) if args.transactional_validation else None
+        pre_update_optimizer_state = copy.deepcopy(optimizer.state_dict()) if args.transactional_validation else None
         trajectories: list[Trajectory] = []
         # Score multiple random noises for the *same* prompt. This gives the
         # reward-normalized advantage a meaningful within-prompt comparison,
@@ -710,9 +800,11 @@ def main() -> None:
             f"mean_MRC={epoch_record['mean_mrc']:.6f}, grad_norm={update['grad_norm']:.6f}",
             flush=True,
         )
-        save_lora(pipe.unet, args.output_dir / "checkpoints" / f"lora_epoch_{epoch:03d}.pt")
-
-        should_validate = (epoch + 1) % args.validation_every == 0 or epoch + 1 == args.epochs
+        should_validate = (
+            args.transactional_validation
+            or (epoch + 1) % args.validation_every == 0
+            or epoch + 1 == args.epochs
+        )
         if should_validate:
             validation = evaluate_prompts(
                 pipe,
@@ -724,14 +816,28 @@ def main() -> None:
                 args,
             )
             epoch_record["validation_mrc"] = validation["mean_mrc"]
-            if validation["mean_mrc"] < best_validation_mrc:
+            improved = validation["mean_mrc"] < best_validation_mrc
+            if improved:
                 best_validation_mrc = validation["mean_mrc"]
                 best_epoch = epoch
                 best_state = save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
                 validations_without_improvement = 0
+                epoch_record["update_accepted"] = True
                 print(f"[RL {epoch + 1}/{args.epochs}] new best validation MRC={best_validation_mrc:.6f}", flush=True)
             else:
                 validations_without_improvement += 1
+                if args.transactional_validation:
+                    assert pre_update_state is not None and pre_update_optimizer_state is not None
+                    restore_lora(pipe.unet, pre_update_state)
+                    optimizer.load_state_dict(pre_update_optimizer_state)
+                    epoch_record["update_accepted"] = False
+                    print(
+                        f"[RL {epoch + 1}/{args.epochs}] rejected update and restored prior LoRA: "
+                        f"validation MRC={validation['mean_mrc']:.6f}; best={best_validation_mrc:.6f}",
+                        flush=True,
+                    )
+                else:
+                    epoch_record["update_accepted"] = True
                 print(
                     f"[RL {epoch + 1}/{args.epochs}] validation MRC={validation['mean_mrc']:.6f}; "
                     f"best={best_validation_mrc:.6f}; no-improvement={validations_without_improvement}",
@@ -749,6 +855,10 @@ def main() -> None:
                         best_validation_mrc=best_validation_mrc,
                     )
                     break
+        # A transactional rejected candidate must never be presented as an
+        # epoch checkpoint that a user could later load by mistake.
+        if not args.transactional_validation or epoch_record.get("update_accepted", False):
+            save_lora(pipe.unet, args.output_dir / "checkpoints" / f"lora_epoch_{epoch:03d}.pt")
         write_training_progress(
             progress_file,
             status="running",
@@ -763,17 +873,7 @@ def main() -> None:
 
     restore_lora(pipe.unet, best_state)
     pipe.unet.eval()
-    evaluation = sample_trajectory(
-        pipe,
-        args.final_prompt,
-        args.seed + 100_000,
-        diffusion_device,
-        args.num_steps,
-        args.guidance_scale,
-        args.eta,
-        args.elevation,
-    )
-    score_and_save(evaluation, scorer, args.output_dir / "final_evaluation")
+    final_selection = evaluate_final_candidates(pipe, scorer, diffusion_device, args)
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "lora_final.pt")
     metadata = {
         "pipeline": "open-mvdream-lgm-mrc-on-policy-lora-rlft",
@@ -792,6 +892,8 @@ def main() -> None:
             "eta": args.eta,
             "validation_every": args.validation_every,
             "early_stop_patience": args.early_stop_patience,
+            "learning_rate": args.learning_rate,
+            "transactional_validation": args.transactional_validation,
         },
         "devices": {"mvdream_rl": args.diffusion_device, "lgm_mrc": args.lgm_device},
         "mrc_metric": args.mrc_metric,
@@ -800,12 +902,7 @@ def main() -> None:
         "best_validation_mrc": best_validation_mrc,
         "best_epoch": best_epoch,
         "history": history,
-        "final_evaluation": {
-            "prompt": evaluation.prompt,
-            "seed": evaluation.seed,
-            "mrc": evaluation.mrc,
-            "reward_negative_mrc": evaluation.reward,
-        },
+        "final_evaluation": final_selection,
     }
     (args.output_dir / "rlft_metrics.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     write_training_progress(
@@ -816,7 +913,7 @@ def main() -> None:
         total_epochs=args.epochs,
         best_epoch=best_epoch,
         best_validation_mrc=best_validation_mrc,
-        final_mrc=evaluation.mrc,
+        final_mrc=final_selection["selected"]["mrc"],
     )
     print(f"\nCompleted open RLFT. Results: {args.output_dir.resolve()}")
 

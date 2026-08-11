@@ -49,11 +49,19 @@ All material pipeline changes are recorded here.
   AdamW learning-rate default and `0.2` KL coefficient.
 - Move newly injected fp32 LoRA tensors to the MVDream CUDA device before the
   first sample, fixing the Kaggle CPU/CUDA matrix-device mismatch.
-- Replace the one-update smoke defaults with a T4 x2 quality profile: 16
+- Add an initial T4 x2 quality profile: 16
   updates, four same-prompt trajectories per update, 30 DDIM steps, held-out
   validation, best-LoRA restoration, and early stopping on validation MRC.
 - Add concise live `[RL epoch/total]` progress lines and a continuously updated
   `training_progress.json` file for Kaggle monitoring.
+- Replace the unsafe T4 quality profile with a conservative small-batch LoRA
+  learning rate (`1e-5`), eight trajectories per update, transactional
+  validation rollback, and fixed-seed best-of-eight final selection. Rejected
+  LoRA updates now restore both weights and AdamW moments instead of degrading
+  the next update.
+- Add optional direct-four-view elevation search. The Kaggle profile evaluates
+  -10/-5/0/+5/+10 degrees and keeps the reconstruction with lowest same-pose
+  LPIPS MRC, recording every candidate in `metrics.json`.
 
 ## Earlier work — `implement_full_pipeline`
 

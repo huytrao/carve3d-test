@@ -1,10 +1,12 @@
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from full_pipeline.run import _prepare_rgb, find_view_paths
+from full_pipeline.run import _prepare_rgb, find_view_paths, parse_args
 
 
 class FindViewPathsTest(unittest.TestCase):
@@ -30,6 +32,15 @@ class FindViewPathsTest(unittest.TestCase):
         prepared = _prepare_rgb(source, remove_background=False, recenter_foreground=False)
         self.assertEqual(prepared.shape, (256, 256, 3))
         self.assertEqual(prepared.dtype, np.float32)
+
+    def test_accepts_negative_and_positive_elevation_search_candidates(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["run.py", "--input-dir", "/tmp/views", "--elevation-candidates", "-10", "-5", "0", "5", "10"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.elevation_candidates, [-10.0, -5.0, 0.0, 5.0, 10.0])
 
 
 if __name__ == "__main__":

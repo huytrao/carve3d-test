@@ -94,6 +94,12 @@ uses GPU 1 for LGM automatically when T4 x2 is enabled. LGM inference itself
 is one model on one GPU, so GPU 0 is intentionally left free rather than
 pretending that the reconstruction is distributed across both cards.
 
+The current `code.txt` additionally tries common capture elevations
+(-10/-5/0/+5/+10 degrees) for the real four photos, keeps the lowest
+same-camera LPIPS MRC result, and records all candidate scores in
+`metrics.json`. This is a camera-alignment search, not a claim that MRC alone
+is ground-truth 3D accuracy.
+
 ### Local command
 
 ```bash

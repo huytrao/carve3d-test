@@ -94,6 +94,7 @@ def compute_mrc(
     angles: Iterable[int] = (0, 90, 180, 270),
     metric: str = "lpips",
     crop_size: int = 256,
+    lpips_model=None,
 ) -> tuple[dict, list[ViewScore]]:
     """Compute Carve3D-style MRC between four source and rendered views.
 
@@ -112,7 +113,8 @@ def compute_mrc(
     device = rendered.device
     source = inputs.to(device=device, dtype=torch.float32)
     target = rendered.to(device=device, dtype=torch.float32)
-    lpips_model = _lpips_model(device) if metric == "lpips" else None
+    if metric == "lpips" and lpips_model is None:
+        lpips_model = _lpips_model(device)
     scores: list[ViewScore] = []
 
     with torch.no_grad():
