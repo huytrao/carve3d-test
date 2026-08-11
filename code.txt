@@ -7,6 +7,7 @@
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 REPO_URL = "https://github.com/huytrao/carve3d-test.git"
@@ -15,6 +16,11 @@ WORKDIR = Path("/kaggle/working")
 REPO = WORKDIR / "carve3d-test"
 LGM_ROOT = WORKDIR / "LGM"
 OUTPUT_DIR = WORKDIR / "prompt-smoke-test"
+
+# Keep both Kaggle T4s visible. Prompt-only MVDream is one model and therefore
+# runs on GPU 0; GPU 1 is reserved for reconstruction/MRC in the later full
+# pipeline run.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 PROMPT = " ".join([
     "a wooden chair",
@@ -60,6 +66,20 @@ subprocess.run(
     check=True,
 )
 
+# Confirm that Kaggle was configured with two T4 GPUs before starting. The
+# smoke test still works with one GPU, but tells the user that GPU 1 will not
+# be available for the later full pipeline.
+gpu_probe = subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "import torch; print('CUDA GPU count:', torch.cuda.device_count()); "
+        "[print(f'GPU {i}: {torch.cuda.get_device_name(i)}') "
+        "for i in range(torch.cuda.device_count())]",
+    ],
+    check=True,
+)
+
 # Test ONLY: text prompt -> MVDream -> 4 generated views.
 # No reconstruction, Gaussian PLY, rendering, MRC, or metrics.json is created.
 subprocess.run(
@@ -74,6 +94,8 @@ subprocess.run(
         "42",
         "--num-steps",
         "20",
+        "--device",
+        "0",
         "--output-dir",
         str(OUTPUT_DIR),
     ],
