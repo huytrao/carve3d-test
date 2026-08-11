@@ -59,6 +59,41 @@ This avoids the `NameError: Union` raised by recent `kiui` releases on Kaggle
 Python 3.12. The next notebook run automatically reapplies setup if an older
 dependency stamp is found.
 
+### Kaggle direct import: this project's four real photographs
+
+For the direct-image route, use the dedicated branch and launcher instead of
+the prompt files. It reads real captures only; no MVDream checkpoint is loaded.
+The four camera names and order are mandatory:
+
+```
+view_000.png   # front
+view_090.png   # right
+view_180.png   # back
+view_270.png   # left
+```
+
+Your supplied Kaggle dataset directory is already the default:
+
+```bash
+python run_import_four_views.py
+```
+
+This resolves `/kaggle/input/datasets/traoanhuy/carve3d/views` first and then
+Kaggle's normal mount path `/kaggle/input/carve3d/views`. To set a different
+input folder without editing the file:
+
+```bash
+CARVE3D_INPUT_DIR=/kaggle/input/your-dataset/views python run_import_four_views.py
+```
+
+For a literal copy/paste Kaggle Code cell, open
+[`code_import_four_views.txt`](code_import_four_views.txt), paste its entire
+contents into one cell, and run it. The launcher checks all four filenames
+before installing dependencies, reports exactly which view is missing, and
+uses GPU 1 for LGM automatically when T4 x2 is enabled. LGM inference itself
+is one model on one GPU, so GPU 0 is intentionally left free rather than
+pretending that the reconstruction is distributed across both cards.
+
 ### Local command
 
 ```bash

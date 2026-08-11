@@ -1,0 +1,39 @@
+# Paste this entire file into ONE Kaggle Code cell, then press Run.
+# Kaggle settings required: Internet ON, GPU accelerator ON (T4 x2 is supported).
+# It uses your four real images directly. No prompt/MVDream model is loaded.
+
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path("/kaggle/working/carve3d-test")
+REPO_URL = "https://github.com/huytrao/carve3d-test.git"
+BRANCH = "import_direct_four_views"
+INPUT_DIR = Path("/kaggle/input/datasets/traoanhuy/carve3d/views")
+OUTPUT_DIR = Path("/kaggle/working/carve3d-four-view-output")
+LGM_ROOT = Path("/kaggle/working/LGM")
+
+if not REPO.is_dir():
+    subprocess.run(
+        ["git", "clone", "--quiet", "--depth", "1", "--branch", BRANCH, REPO_URL, str(REPO)],
+        check=True,
+    )
+else:
+    subprocess.run(["git", "-C", str(REPO), "fetch", "--quiet", "origin", BRANCH], check=True)
+    subprocess.run(["git", "-C", str(REPO), "switch", "--quiet", BRANCH], check=True)
+    subprocess.run(["git", "-C", str(REPO), "pull", "--quiet", "--ff-only", "origin", BRANCH], check=True)
+
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+# This validates view_000, view_090, view_180, view_270 BEFORE installing LGM.
+# On two T4 GPUs LGM is automatically placed on GPU 1.
+from kaggle_import_four_views import main as run_four_real_views
+
+run_four_real_views(
+    [
+        "--input-dir", str(INPUT_DIR),
+        "--output-dir", str(OUTPUT_DIR),
+        "--lgm-root", str(LGM_ROOT),
+    ]
+)
