@@ -44,6 +44,9 @@ All material pipeline changes are recorded here.
   public RLFT cycle, instead of the former prompt-only MVDream smoke test.
 - The DDIM log-probability helper handles the deterministic final DDIM action
   without producing NaN/Inf during an RL update.
+- The open RLFT LoRA now follows the paper's applicable mixed-precision recipe:
+  rank 4 fp32 LoRA weights on a frozen fp16 base UNet, with the paper's `3e-4`
+  AdamW learning-rate default and `0.2` KL coefficient.
 
 ## Earlier work — `implement_full_pipeline`
 

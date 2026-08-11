@@ -36,3 +36,9 @@ paper's training scale. The paper trained for 55 epochs on 48 A100 80GB GPUs,
 with batch size 768, taking 16.5 hours. Increasing `RL_EPOCHS` and
 `RL_DDIM_STEPS` in `code.txt` increases cost sharply and still does not make the
 MVDream/LGM substitute numerically comparable to Carve3DM.
+
+The LoRA part follows the paper's reported recipe where it is applicable:
+rank 4, frozen fp16 base networks, fp32 LoRA UNet weights, AdamW learning rate
+`3e-4`, and a `0.2` KL coefficient. The source MVDream/LGM replacement has a
+different architecture and reward implementation, so this is not a claim that
+the resulting weights are compatible with the unavailable Instant3D model.

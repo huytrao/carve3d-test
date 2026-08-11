@@ -77,12 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1, help="RL epochs; default is one real on-policy update.")
     parser.add_argument("--samples-per-epoch", type=int, default=2, help="At least 2 is required to form a reward advantage.")
     parser.add_argument("--num-steps", type=int, default=10, help="DDIM denoising steps; use 30+ only after the smoke run works.")
-    parser.add_argument("--guidance-scale", type=float, default=7.5)
+    parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--eta", type=float, default=1.0, help="Stochastic DDIM eta; non-zero is required for policy log probabilities.")
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=float, default=4.0)
-    parser.add_argument("--kl-coeff", type=float, default=0.02, help="Approximate KL-to-sampling-policy penalty.")
+    parser.add_argument("--kl-coeff", type=float, default=0.2, help="Approximate KL-to-sampling-policy penalty.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--elevation", type=float, default=0.0)
@@ -119,13 +119,19 @@ def make_lora_linear(base_layer: Any, rank: int, alpha: float) -> Any:
             self.scale = alpha / rank
             for parameter in self.base.parameters():
                 parameter.requires_grad_(False)
-            self.lora_a = nn.Parameter(torch.empty(rank, base.in_features, dtype=base.weight.dtype))
-            self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank, dtype=base.weight.dtype))
+            # Match Carve3D's mixed-precision recipe: the frozen base UNet is
+            # fp16, while its trainable rank-4 LoRA weights stay fp32.
+            self.lora_a = nn.Parameter(torch.empty(rank, base.in_features, dtype=torch.float32))
+            self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32))
             nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
 
         def forward(self, inputs):
-            residual = functional.linear(functional.linear(inputs, self.lora_a), self.lora_b)
-            return self.base(inputs) + residual * self.scale
+            base_output = self.base(inputs)
+            # Explicitly disable autocast for this residual: otherwise CUDA
+            # would silently cast both fp32 LoRA matrices back to fp16.
+            with torch.autocast(device_type=inputs.device.type, enabled=False):
+                residual = functional.linear(functional.linear(inputs.float(), self.lora_a), self.lora_b)
+            return base_output + (residual * self.scale).to(dtype=base_output.dtype)
 
     return _LoRALinear(base_layer)
 

@@ -20,6 +20,9 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertEqual(str(args.lgm_root), "/tmp/LGM")
         self.assertEqual((args.diffusion_device, args.lgm_device), (0, 1))
         self.assertEqual(args.samples_per_epoch, 2)
+        self.assertEqual(args.lora_rank, 4)
+        self.assertEqual(args.learning_rate, 3e-4)
+        self.assertEqual(args.kl_coeff, 0.2)
 
 
 if __name__ == "__main__":
