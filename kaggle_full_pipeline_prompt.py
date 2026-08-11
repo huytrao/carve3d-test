@@ -25,7 +25,7 @@ from pathlib import Path
 DEFAULT_LGM_ROOT = Path("/kaggle/working/LGM")
 LGM_CHECKPOINT_URL = "https://huggingface.co/ashawkey/LGM/resolve/main/model_fp16_fixrot.safetensors"
 MVDREAM_MODEL_URL = "https://huggingface.co/ashawkey/mvdream-sd2.1-diffusers"
-SETUP_VERSION = "2"
+SETUP_VERSION = "3"
 
 
 def _has_option(arguments: list[str], option: str) -> bool:

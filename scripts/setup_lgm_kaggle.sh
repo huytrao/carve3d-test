@@ -11,7 +11,7 @@ CHECKPOINT_DIR="${LGM_DIR}/pretrained"
 CHECKPOINT="${CHECKPOINT_DIR}/model_fp16_fixrot.safetensors"
 CHECKPOINT_URL="https://huggingface.co/ashawkey/LGM/resolve/main/model_fp16_fixrot.safetensors"
 CHECKPOINT_SHA256="744d6324656342c64f871308e73db97f0eb51858d94329b30090e986a6d050ab"
-SETUP_VERSION="2"
+SETUP_VERSION="3"
 
 if [ ! -d "${LGM_DIR}/.git" ]; then
   git clone "${LGM_REPO}" "${LGM_DIR}"
