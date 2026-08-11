@@ -54,6 +54,11 @@ Kaggle Python 3.12. The runnable pipeline still writes `reconstruction.ply`,
 same-camera renders, orbit video, and MRC. Set `INSTALL_NVDIFFRAST=1` only in
 an environment where you need mesh conversion and have a compatible build.
 
+The setup pins `kiui==0.2.3`, the version compatible with LGM's 2024 source.
+This avoids the `NameError: Union` raised by recent `kiui` releases on Kaggle
+Python 3.12. The next notebook run automatically reapplies setup if an older
+dependency stamp is found.
+
 ### Local command
 
 ```bash

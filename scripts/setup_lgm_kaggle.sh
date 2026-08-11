@@ -11,6 +11,7 @@ CHECKPOINT_DIR="${LGM_DIR}/pretrained"
 CHECKPOINT="${CHECKPOINT_DIR}/model_fp16_fixrot.safetensors"
 CHECKPOINT_URL="https://huggingface.co/ashawkey/LGM/resolve/main/model_fp16_fixrot.safetensors"
 CHECKPOINT_SHA256="744d6324656342c64f871308e73db97f0eb51858d94329b30090e986a6d050ab"
+SETUP_VERSION="2"
 
 if [ ! -d "${LGM_DIR}/.git" ]; then
   git clone "${LGM_REPO}" "${LGM_DIR}"
@@ -25,6 +26,10 @@ python -m pip install --upgrade pip
 # Gaussian rasterizer must compile against the already-installed PyTorch ABI.
 python -m pip install --upgrade --no-deps xformers || echo "xFormers install skipped; inference can still run without memory-efficient attention."
 python -m pip install -r "${LGM_DIR}/requirements.txt"
+# LGM was released against kiui 0.2.3. Newer kiui releases removed the typing
+# exports used by LGM and raise `NameError: Union` on import under Python 3.12.
+# Keep this precise, no-dependency pin so Kaggle's CUDA PyTorch is untouched.
+python -m pip install --upgrade --no-deps "kiui==0.2.3"
 
 if [ ! -d "${RASTER_DIR}/.git" ]; then
   git clone --recursive https://github.com/ashawkey/diff-gaussian-rasterization "${RASTER_DIR}"
@@ -54,3 +59,4 @@ print(f"CUDA ready: {torch.cuda.get_device_name(0)}")
 PY
 echo "LGM installed at ${LGM_DIR}"
 echo "Checkpoint ready: ${CHECKPOINT}"
+printf '%s\n' "${SETUP_VERSION}" > "${LGM_DIR}/.carve3d_setup_version"
