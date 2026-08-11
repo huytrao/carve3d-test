@@ -1,0 +1,61 @@
+Tạo infographic kỹ thuật khổ ngang 16:9, phong cách paper CVPR hiện đại, sạch,
+chữ tiếng Việt rõ ràng, nền trắng, đường nối xanh navy, icon GPU/CUDA/mô hình AI,
+không dùng phong cách hoạt hình. Tiêu đề lớn: "Open Carve3D RLFT Pipeline trên Kaggle T4×2".
+Phụ đề nhỏ: "Bản tái tạo chạy được bằng model công khai; không phải checkpoint Carve3DM/Instant3D gốc.".
+
+Chia infographic thành hai lane nằm ngang, sau đó hội tụ ở phần output.
+
+LANE A — "Đánh giá 4 ảnh thật (direct reconstruction / MRC)" ở nửa trên:
+1. Khối input bên trái gồm đúng bốn thumbnail ảnh ghế, nhãn: view_000 (front),
+   view_090 (right), view_180 (back), view_270 (left). Dòng chú thích:
+   "/kaggle/input/.../views".
+2. Mũi tên sang khối "Preprocess" gồm: white background, recenter, resize 256×256,
+   giữ thứ tự camera 0° / 90° / 180° / 270°.
+3. Mũi tên sang GPU 1 Tesla T4, khối lớn "LGM pretrained" với mô tả:
+   "4 views → 3D Gaussian Splat reconstruction".
+4. Mũi tên sang "Render lại cùng 4 camera"; hiện thumbnail render 0°, 90°, 180°, 270°.
+5. Mũi tên sang "LPIPS MRC" với công thức: MRC = mean LPIPS(input crop, render crop),
+   ghi rõ "lower is better" và output: reconstruction.ply, render_grid.png,
+   metrics.json, orbit.mp4.
+
+LANE B — "RL Fine-tuning bằng model công khai" ở nửa dưới:
+1. Khối "MVDream pretrained public checkpoint" trên GPU 0 Tesla T4.
+   Bên trong vẽ UNet nền băng tuyết, nhãn "frozen fp16 base UNet".
+2. Trên attention blocks của UNet, vẽ các adapter đỏ/cam nhỏ, nhãn:
+   "LoRA rank 4, trainable fp32". Công thức nhỏ: W' = W + B × A.
+   Chỉ các adapter LoRA có mũi tên gradient; base UNet có biểu tượng khóa/freeze.
+3. Input prompt + random noise đi vào MVDream. Ví dụ prompt:
+   "a wooden chair, isolated studio product photograph, white background".
+   Mũi tên đi ra đúng 4 ảnh đa góc nhìn ở 0° / 90° / 180° / 270°.
+4. Mũi tên từ 4 ảnh sang GPU 1: "LGM pretrained → reconstruct Gaussian → render same cameras".
+5. Mũi tên sang khối xanh dương "Foreground-crop LPIPS MRC" rồi sang khối vàng:
+   "Reward r = −MRC".
+6. Mũi tên sang khối tím: "Reward-normalized advantage" với công thức:
+   A = (r − mean(r)) / (std(r) + epsilon).
+7. Mũi tên sang khối đỏ: "DDIM log probabilities + REINFORCE / pure on-policy RL".
+8. Mũi tên quay vòng về LoRA adapters, ghi rõ:
+   "backprop chỉ update LoRA A, B"; thêm nhãn "approximate KL control".
+
+Ở giữa hai lane thêm chú thích phân bổ phần cứng:
+"Kaggle T4×2: GPU 0 = MVDream sampling + LoRA backprop; GPU 1 = LGM reconstruction + render + LPIPS MRC reward".
+Không vẽ GPU 1 train DDP; thêm ghi chú nhỏ: "LGM chiếm VRAM GPU 1, vì vậy không DDP MVDream trên cả hai T4".
+
+Ở cạnh phải vẽ timeline training quality profile:
+"Baseline validation MRC" → "16 RL updates" → "mỗi update: 4 stochastic trajectories cùng prompt" →
+"30 DDIM steps" → "validation mỗi 2 updates" → "early stopping" →
+"chọn validation MRC thấp nhất".
+Vẽ một chart nhỏ: đường validation MRC đi xuống rồi plateau; đánh dấu cờ "best epoch".
+
+OUTPUT cuối cùng ở góc phải dưới, dạng folder Kaggle:
+"/kaggle/working/carve3d-open-rlft-output/"
+chứa các file minh họa: checkpoints/best_lora.pt, checkpoints/lora_final.pt,
+rlft_metrics.json, training_progress.json, validation/, final_evaluation/source_grid.png,
+final_evaluation/render_grid.png. Ghi rõ: "Train một lần → load best_lora.pt → dùng lại cho nhiều prompt".
+
+Khung cảnh báo cam ở đáy infographic:
+"Giới hạn tái tạo: Carve3D paper gốc dùng Instant3D + sparse-view LRM không phát hành công khai;
+pipeline này dùng MVDream + LGM public, nên không so sánh trực tiếp số liệu với Carve3DM gốc.".
+
+Yêu cầu trực quan: mũi tên đi trái sang phải, màu nhất quán: input xanh lá, pretrained xanh dương,
+LoRA cam, reward vàng, RL đỏ/tím, output xanh navy. Cỡ chữ đủ đọc, không bịa checkpoint,
+không vẽ prompt-only MVDream như kết quả Carve3D chính xác, không watermark, không logo hãng.
