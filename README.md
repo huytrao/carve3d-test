@@ -48,6 +48,12 @@ and creates `reconstruction.ply`, render grids, an orbit video, and
 stack; this direct-four-view adapter does not load ImageDream, but a 16 GB
 Kaggle GPU remains the practical target.
 
+The Kaggle setup intentionally skips `nvdiffrast`: it is only necessary for
+LGM's separate `.ply` → `.glb` mesh conversion and currently fails to build on
+Kaggle Python 3.12. The runnable pipeline still writes `reconstruction.ply`,
+same-camera renders, orbit video, and MRC. Set `INSTALL_NVDIFFRAST=1` only in
+an environment where you need mesh conversion and have a compatible build.
+
 ### Local command
 
 ```bash

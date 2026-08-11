@@ -30,7 +30,16 @@ if [ ! -d "${RASTER_DIR}/.git" ]; then
   git clone --recursive https://github.com/ashawkey/diff-gaussian-rasterization "${RASTER_DIR}"
 fi
 python -m pip install --no-build-isolation "${RASTER_DIR}"
-python -m pip install git+https://github.com/NVlabs/nvdiffrast
+
+# nvdiffrast is used only by LGM's separate `convert.py` mesh-export utility;
+# LGM reconstruction, Gaussian `.ply` export, same-pose rendering, and MRC do
+# not import it.  It currently has no build path for Kaggle's Python 3.12, so
+# keep it opt-in instead of making the runnable pipeline fail during setup.
+if [ "${INSTALL_NVDIFFRAST:-0}" = "1" ]; then
+  python -m pip install git+https://github.com/NVlabs/nvdiffrast
+else
+  echo "Skipping optional nvdiffrast (only needed for convert.py -> .glb mesh export)."
+fi
 
 mkdir -p "${CHECKPOINT_DIR}"
 if [ ! -s "${CHECKPOINT}" ]; then
