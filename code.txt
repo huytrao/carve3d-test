@@ -27,13 +27,30 @@ INPUT_DIR = Path("/kaggle/input/datasets/traoanhuy/carve3d/views")
 DIRECT_OUTPUT_DIR = WORKDIR / "carve3d-direct-four-view-output"
 RLFT_OUTPUT_DIR = WORKDIR / "carve3d-open-rlft-output"
 
-# This default is a genuine but small RL run: 2 sampled trajectories followed
-# by 1 pure on-policy LoRA update. It is a Kaggle smoke/reproduction run, NOT
-# the paper's 55 epochs on 48 A100 80GB GPUs.
-RL_EPOCHS = 1
-RL_SAMPLES_PER_EPOCH = 2
-RL_DDIM_STEPS = 10
+# Quality profile for T4 x2. Each epoch evaluates four random noises for the
+# same prompt, performs one on-policy LoRA update, and rotates to another prompt
+# at the next epoch. Held-out MRC validation retains best_lora.pt and stops when
+# it no longer improves. This is still smaller than the paper's 48-A100 run.
+RL_EPOCHS = 16
+RL_SAMPLES_PER_EPOCH = 4
+RL_DDIM_STEPS = 30
 RL_MRC_METRIC = "lpips"  # Paper metric. Use "l1" only when LPIPS download is blocked.
+RL_VALIDATION_EVERY = 2
+RL_EARLY_STOP_PATIENCE = 4
+TRAIN_PROMPTS = [
+    "a wooden chair, isolated studio product photograph, white background",
+    "a ceramic teapot, isolated studio product photograph, white background",
+    "a leather travel suitcase, isolated studio product photograph, white background",
+    "a brass desk clock, isolated studio product photograph, white background",
+    "a small red toy car, isolated studio product photograph, white background",
+    "a blue glass perfume bottle, isolated studio product photograph, white background",
+    "a vintage film camera, isolated studio product photograph, white background",
+    "a woven picnic basket, isolated studio product photograph, white background",
+]
+VALIDATION_PROMPTS = [
+    "a red toy car, isolated studio product photograph, white background",
+    "a brass table lamp, isolated studio product photograph, white background",
+]
 
 # Public model downloads and package setup stay quiet; actual metrics/errors are
 # intentionally shown. GPU 0 is MVDream/RL; GPU 1 is LGM/MRC.
@@ -77,26 +94,28 @@ subprocess.run(
     check=True,
 )
 
-# Stage B + C. Runs an actual REINFORCE-style, one-policy-update LoRA RLFT
-# cycle with reward = -MRC, then writes post-RL images/metrics/checkpoint.
-subprocess.run(
-    [
-        sys.executable,
-        str(REPO / "open_mvdream_rlft.py"),
-        "--lgm-root", str(LGM_ROOT),
-        "--output-dir", str(RLFT_OUTPUT_DIR),
-        "--diffusion-device", "0",
-        "--lgm-device", "1",
-        "--epochs", str(RL_EPOCHS),
-        "--samples-per-epoch", str(RL_SAMPLES_PER_EPOCH),
-        "--num-steps", str(RL_DDIM_STEPS),
-        "--mrc-metric", RL_MRC_METRIC,
-        "--prompt", "a wooden chair, isolated studio product photograph, white background",
-        "--prompt", "a ceramic teapot, isolated studio product photograph, white background",
-        "--final-prompt", "a wooden chair, isolated studio product photograph, white background",
-    ],
-    check=True,
-)
+# Stage B + C. Quality RLFT: public MVDream/LGM, reward = -MRC, validation
+# best-checkpoint selection, then post-RL output from the best LoRA state.
+rlft_command = [
+    sys.executable,
+    str(REPO / "open_mvdream_rlft.py"),
+    "--lgm-root", str(LGM_ROOT),
+    "--output-dir", str(RLFT_OUTPUT_DIR),
+    "--diffusion-device", "0",
+    "--lgm-device", "1",
+    "--epochs", str(RL_EPOCHS),
+    "--samples-per-epoch", str(RL_SAMPLES_PER_EPOCH),
+    "--num-steps", str(RL_DDIM_STEPS),
+    "--mrc-metric", RL_MRC_METRIC,
+    "--validation-every", str(RL_VALIDATION_EVERY),
+    "--early-stop-patience", str(RL_EARLY_STOP_PATIENCE),
+    "--final-prompt", "a wooden chair, isolated studio product photograph, white background",
+]
+for prompt in TRAIN_PROMPTS:
+    rlft_command.extend(["--prompt", prompt])
+for prompt in VALIDATION_PROMPTS:
+    rlft_command.extend(["--validation-prompt", prompt])
+subprocess.run(rlft_command, check=True)
 
 print("\nCOMPLETED")
 print("Direct four-image reconstruction:", DIRECT_OUTPUT_DIR)

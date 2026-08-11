@@ -74,9 +74,9 @@ def parse_args() -> argparse.Namespace:
         dest="prompts",
         help="One training prompt. Repeat --prompt for more. Defaults to two conservative object prompts.",
     )
-    parser.add_argument("--epochs", type=int, default=1, help="RL epochs; default is one real on-policy update.")
-    parser.add_argument("--samples-per-epoch", type=int, default=2, help="At least 2 is required to form a reward advantage.")
-    parser.add_argument("--num-steps", type=int, default=10, help="DDIM denoising steps; use 30+ only after the smoke run works.")
+    parser.add_argument("--epochs", type=int, default=16, help="On-policy RL updates. The quality preset uses 16 on T4 x2.")
+    parser.add_argument("--samples-per-epoch", type=int, default=4, help="Same-prompt trajectories per update; at least 2 are required for advantages.")
+    parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps. 30 is the practical T4 x2 quality setting.")
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--eta", type=float, default=1.0, help="Stochastic DDIM eta; non-zero is required for policy log probabilities.")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -91,6 +91,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-size", type=int, default=256)
     parser.add_argument("--mrc-metric", choices=("lpips", "l1"), default="lpips")
     parser.add_argument("--final-prompt", default="a wooden chair, isolated studio product photograph, white background")
+    parser.add_argument(
+        "--validation-prompt",
+        action="append",
+        dest="validation_prompts",
+        help="Held-out prompt for best-checkpoint selection. Repeat for multiple prompts.",
+    )
+    parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
+    parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
     return parser.parse_args()
 
 
@@ -98,6 +106,13 @@ def default_prompts() -> list[str]:
     return [
         "a wooden chair, isolated studio product photograph, white background",
         "a ceramic teapot, isolated studio product photograph, white background",
+    ]
+
+
+def default_validation_prompts() -> list[str]:
+    return [
+        "a red toy car, isolated studio product photograph, white background",
+        "a brass table lamp, isolated studio product photograph, white background",
     ]
 
 
@@ -494,20 +509,74 @@ def replay_policy_gradient(
     }
 
 
-def save_lora(unet: Any, destination: Path) -> None:
-    """Save only trained LoRA tensors, never a multi-gigabyte base checkpoint."""
+def lora_state(unet: Any) -> dict[str, Any]:
+    """Return an independent CPU copy of the small trainable LoRA state."""
 
-    import torch
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    state = {
+    state: dict[str, Any] = {
         name: parameter.detach().cpu()
         for name, parameter in unet.named_parameters()
         if parameter.requires_grad and ("lora_a" in name or "lora_b" in name)
     }
     if not state:
         raise RuntimeError("No LoRA parameters were found to save.")
+    return state
+
+
+def save_lora(unet: Any, destination: Path) -> dict[str, Any]:
+    """Save only trained LoRA tensors, never a multi-gigabyte base checkpoint."""
+
+    import torch
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    state = lora_state(unet)
     torch.save(state, destination)
+    return state
+
+
+def restore_lora(unet: Any, state: dict[str, Any]) -> None:
+    """Restore the validation-best LoRA weights before final generation."""
+
+    parameters = dict(unet.named_parameters())
+    for name, value in state.items():
+        if name not in parameters:
+            raise RuntimeError(f"Best LoRA checkpoint has no matching parameter: {name}")
+        parameters[name].data.copy_(value.to(device=parameters[name].device, dtype=parameters[name].dtype))
+
+
+def evaluate_prompts(
+    pipe: Any,
+    prompts: Sequence[str],
+    scorer: LgmMrcScorer,
+    destination: Path,
+    seed: int,
+    device: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Generate fixed-seed held-out prompts and return their mean MRC."""
+
+    was_training = pipe.unet.training
+    pipe.unet.eval()
+    records: list[dict[str, Any]] = []
+    for index, prompt in enumerate(prompts):
+        trajectory = sample_trajectory(
+            pipe,
+            prompt,
+            seed + index,
+            device,
+            args.num_steps,
+            args.guidance_scale,
+            args.eta,
+            args.elevation,
+        )
+        score_and_save(trajectory, scorer, destination / f"prompt_{index:02d}")
+        records.append({"prompt": prompt, "seed": trajectory.seed, "mrc": trajectory.mrc})
+    mean_mrc = float(np.mean([record["mrc"] for record in records]))
+    result = {"mean_mrc": mean_mrc, "records": records}
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if was_training:
+        pipe.unet.train()
+    return result
 
 
 def main() -> None:
@@ -518,7 +587,10 @@ def main() -> None:
         raise ValueError("--samples-per-epoch must be at least 2 so RL can compute a reward advantage")
     if args.num_steps < 2:
         raise ValueError("--num-steps must be at least 2")
+    if args.validation_every < 1 or args.early_stop_patience < 1:
+        raise ValueError("--validation-every and --early-stop-patience must be at least 1")
     prompts = args.prompts or default_prompts()
+    validation_prompts = args.validation_prompts or default_validation_prompts()
     if not prompts:
         raise ValueError("Supply at least one --prompt")
 
@@ -533,15 +605,34 @@ def main() -> None:
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate)
     scorer = LgmMrcScorer(args.lgm_root, args.lgm_device, args.render_size, args.mrc_metric, args.elevation)
     history: list[dict[str, Any]] = []
+    validation_seed = args.seed + 1_000_000
+    baseline_validation = evaluate_prompts(
+        pipe,
+        validation_prompts,
+        scorer,
+        args.output_dir / "validation" / "baseline",
+        validation_seed,
+        diffusion_device,
+        args,
+    )
+    best_validation_mrc = baseline_validation["mean_mrc"]
+    best_epoch = -1
+    best_state = lora_state(pipe.unet)
+    save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
+    validations_without_improvement = 0
+    print(f"baseline validation MRC={best_validation_mrc:.6f}")
 
     for epoch in range(args.epochs):
         trajectories: list[Trajectory] = []
+        # Score multiple random noises for the *same* prompt. This gives the
+        # reward-normalized advantage a meaningful within-prompt comparison,
+        # then cycles over the curated prompt list across epochs.
+        epoch_prompt = prompts[epoch % len(prompts)]
         for sample_index in range(args.samples_per_epoch):
-            prompt = prompts[(epoch * args.samples_per_epoch + sample_index) % len(prompts)]
             seed = args.seed + epoch * args.samples_per_epoch + sample_index
             trajectory = sample_trajectory(
                 pipe,
-                prompt,
+                epoch_prompt,
                 seed,
                 diffusion_device,
                 args.num_steps,
@@ -577,6 +668,35 @@ def main() -> None:
         print(json.dumps(epoch_record, indent=2))
         save_lora(pipe.unet, args.output_dir / "checkpoints" / f"lora_epoch_{epoch:03d}.pt")
 
+        should_validate = (epoch + 1) % args.validation_every == 0 or epoch + 1 == args.epochs
+        if should_validate:
+            validation = evaluate_prompts(
+                pipe,
+                validation_prompts,
+                scorer,
+                args.output_dir / "validation" / f"epoch_{epoch:03d}",
+                validation_seed,
+                diffusion_device,
+                args,
+            )
+            epoch_record["validation_mrc"] = validation["mean_mrc"]
+            if validation["mean_mrc"] < best_validation_mrc:
+                best_validation_mrc = validation["mean_mrc"]
+                best_epoch = epoch
+                best_state = save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
+                validations_without_improvement = 0
+                print(f"new best validation MRC={best_validation_mrc:.6f} at epoch={epoch}")
+            else:
+                validations_without_improvement += 1
+                print(
+                    f"validation MRC={validation['mean_mrc']:.6f}; best={best_validation_mrc:.6f}; "
+                    f"no-improvement validations={validations_without_improvement}"
+                )
+                if validations_without_improvement >= args.early_stop_patience:
+                    print("Early stopping: validation MRC stopped improving.")
+                    break
+
+    restore_lora(pipe.unet, best_state)
     pipe.unet.eval()
     evaluation = sample_trajectory(
         pipe,
@@ -605,10 +725,15 @@ def main() -> None:
             "samples_per_epoch": args.samples_per_epoch,
             "ddim_steps": args.num_steps,
             "eta": args.eta,
+            "validation_every": args.validation_every,
+            "early_stop_patience": args.early_stop_patience,
         },
         "devices": {"mvdream_rl": args.diffusion_device, "lgm_mrc": args.lgm_device},
         "mrc_metric": args.mrc_metric,
         "lora_projection_count": lora_projection_count,
+        "baseline_validation": baseline_validation,
+        "best_validation_mrc": best_validation_mrc,
+        "best_epoch": best_epoch,
         "history": history,
         "final_evaluation": {
             "prompt": evaluation.prompt,

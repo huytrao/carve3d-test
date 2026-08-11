@@ -30,12 +30,15 @@ TODOs.
    approximate KL-to-behaviour-policy penalty, then saves only LoRA tensors.
 5. A fresh post-RL prompt sample is reconstructed and evaluated.
 
-The default is intentionally one epoch/two samples/ten DDIM steps so the loop
-is executable on T4 x2. It demonstrates the real data path and update, not the
-paper's training scale. The paper trained for 55 epochs on 48 A100 80GB GPUs,
-with batch size 768, taking 16.5 hours. Increasing `RL_EPOCHS` and
-`RL_DDIM_STEPS` in `code.txt` increases cost sharply and still does not make the
-MVDream/LGM substitute numerically comparable to Carve3DM.
+`code.txt` uses the strongest practical T4 x2 profile: 16 RL updates, four
+same-prompt stochastic trajectories per update, 30 DDIM steps, held-out
+fixed-seed validation every two updates, and early stopping. It retains
+`best_lora.pt` by lowest validation MRC, then restores it for the final result.
+This demonstrates the real data path and update, not the paper's training
+scale. The paper trained for 55 epochs on 48 A100 80GB GPUs, with batch size
+768, taking 16.5 hours. Increasing `RL_EPOCHS` and `RL_DDIM_STEPS` further
+increases cost sharply and still does not make the MVDream/LGM substitute
+numerically comparable to Carve3DM.
 
 The LoRA part follows the paper's reported recipe where it is applicable:
 rank 4, frozen fp16 base networks, fp32 LoRA UNet weights, AdamW learning rate

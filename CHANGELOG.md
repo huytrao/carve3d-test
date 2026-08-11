@@ -49,6 +49,9 @@ All material pipeline changes are recorded here.
   AdamW learning-rate default and `0.2` KL coefficient.
 - Move newly injected fp32 LoRA tensors to the MVDream CUDA device before the
   first sample, fixing the Kaggle CPU/CUDA matrix-device mismatch.
+- Replace the one-update smoke defaults with a T4 x2 quality profile: 16
+  updates, four same-prompt trajectories per update, 30 DDIM steps, held-out
+  validation, best-LoRA restoration, and early stopping on validation MRC.
 
 ## Earlier work — `implement_full_pipeline`
 
