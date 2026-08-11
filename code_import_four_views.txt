@@ -19,8 +19,26 @@ if not REPO.is_dir():
         check=True,
     )
 else:
-    subprocess.run(["git", "-C", str(REPO), "fetch", "--quiet", "origin", BRANCH], check=True)
-    subprocess.run(["git", "-C", str(REPO), "switch", "--quiet", BRANCH], check=True)
+    # A previous Kaggle run may have cloned only another branch. Fetch the
+    # remote-tracking ref explicitly, then create the local branch if needed.
+    subprocess.run(
+        [
+            "git", "-C", str(REPO), "fetch", "--quiet", "origin",
+            f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}",
+        ],
+        check=True,
+    )
+    has_local_branch = subprocess.run(
+        ["git", "-C", str(REPO), "show-ref", "--verify", "--quiet", f"refs/heads/{BRANCH}"],
+        check=False,
+    ).returncode == 0
+    if has_local_branch:
+        subprocess.run(["git", "-C", str(REPO), "switch", "--quiet", BRANCH], check=True)
+    else:
+        subprocess.run(
+            ["git", "-C", str(REPO), "switch", "--quiet", "--track", "-c", BRANCH, f"origin/{BRANCH}"],
+            check=True,
+        )
     subprocess.run(["git", "-C", str(REPO), "pull", "--quiet", "--ff-only", "origin", BRANCH], check=True)
 
 if str(REPO) not in sys.path:
