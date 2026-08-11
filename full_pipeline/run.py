@@ -78,6 +78,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--render-size", type=int, default=512, help="Output render edge length; 256 lowers GPU use.")
     parser.add_argument("--mrc-metric", choices=("lpips", "l1"), default="lpips", help="LPIPS is Carve3D MRC; L1 is only a dependency-light smoke-test metric.")
+    parser.add_argument(
+        "--refine-steps",
+        type=int,
+        default=0,
+        help=(
+            "Direct-four-view only: optimize the LGM-initialized Gaussians against the supplied photos. "
+            "0 keeps feed-forward-only inference."
+        ),
+    )
+    parser.add_argument(
+        "--refine-learning-rate",
+        type=float,
+        default=0.02,
+        help="Learning rate for direct Gaussian refinement (used only when --refine-steps is positive).",
+    )
+    parser.add_argument(
+        "--refine-eval-every",
+        type=int,
+        default=10,
+        help="Report/save the best direct-refinement MRC every N optimization steps.",
+    )
     parser.add_argument("--lgm-device", type=int, default=0, help="CUDA device used for LGM reconstruction, rendering and MRC.")
     parser.add_argument("--prompt-device", type=int, default=0, help="CUDA device used for MVDream in --prompt mode.")
     parser.add_argument("--no-remove-background", dest="remove_background", action="store_false", help="Keep existing image backgrounds. Normally real images should be mattes on white.")
@@ -260,9 +281,144 @@ def _save_orbit(model, opt, device, gaussians, output_path: Path, elevation: flo
     imageio.mimwrite(output_path, movie, fps=30, quality=8)
 
 
+def _refine_direct_gaussians(
+    model,
+    opt,
+    device,
+    initial_gaussians,
+    target_images,
+    elevation: float,
+    initial_mrc: dict,
+    mrc_metric: str,
+    lpips_model,
+    steps: int,
+    learning_rate: float,
+    evaluate_every: int,
+):
+    """Photometrically refine LGM's feed-forward Gaussian initialization.
+
+    This is deliberately a *direct four-photo* fitting step.  It optimizes the
+    same Gaussian scene rendered at the four supplied camera poses, so unlike
+    prompt RL it can improve the reconstruction the user is actually viewing.
+    Parameter deltas are bounded around LGM's prediction to retain its 3D
+    prior instead of overfitting each photograph independently.
+    """
+
+    import torch
+    import torch.nn.functional as functional
+
+    if steps < 1:
+        raise ValueError("refinement needs at least one step")
+    if learning_rate <= 0:
+        raise ValueError("--refine-learning-rate must be positive")
+    if evaluate_every < 1:
+        raise ValueError("--refine-eval-every must be at least 1")
+
+    from full_pipeline.mrc import compute_mrc
+
+    target = functional.interpolate(
+        target_images, size=(opt.output_size, opt.output_size), mode="bilinear", align_corners=False
+    ).float()
+    # White is the preprocessing convention.  Downweight its pixels so the
+    # refinement concentrates on the object rather than winning by changing
+    # an already-white background.
+    foreground = (target < 0.97).any(dim=1, keepdim=True).float()
+    weights = foreground * 0.95 + 0.05
+    base = initial_gaussians.detach().float()
+    base_positions = base[..., 0:3]
+    base_opacity = base[..., 3:4].clamp(1e-4, 1 - 1e-4)
+    base_scales = base[..., 4:7].clamp_min(1e-5)
+    base_rotations = base[..., 7:11]
+    base_colors = base[..., 11:].clamp(1e-4, 1 - 1e-4)
+
+    # Keep geometry changes local to the LGM prediction. Colour and opacity
+    # can move more freely; that is important for real photographs whose
+    # lighting does not exactly match LGM's synthetic training distribution.
+    position_delta = torch.nn.Parameter(torch.zeros_like(base_positions))
+    opacity_logits = torch.nn.Parameter(torch.logit(base_opacity))
+    log_scales = torch.nn.Parameter(torch.log(base_scales))
+    color_logits = torch.nn.Parameter(torch.logit(base_colors))
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [position_delta], "lr": learning_rate * 0.10},
+            {"params": [opacity_logits], "lr": learning_rate},
+            {"params": [log_scales], "lr": learning_rate * 0.25},
+            {"params": [color_logits], "lr": learning_rate},
+        ]
+    )
+
+    def current_gaussians():
+        positions = base_positions + torch.tanh(position_delta) * 0.08
+        opacity = torch.sigmoid(opacity_logits)
+        scales = torch.exp(log_scales).clamp(1e-5, 0.25)
+        colors = torch.sigmoid(color_logits)
+        return torch.cat((positions, opacity, scales, base_rotations, colors), dim=-1)
+
+    best_gaussians = base.detach().clone()
+    best_rendered = _render_views(model, opt, device, best_gaussians, ANGLES, elevation).detach()
+    best_mrc = initial_mrc
+    history = [{"step": 0, "mrc": initial_mrc["mrc"], "accepted": True}]
+    print(f"[Refine 0/{steps}] baseline MRC={initial_mrc['mrc']:.6f}", flush=True)
+
+    for step in range(1, steps + 1):
+        gaussians = current_gaussians()
+        rendered = _render_views(model, opt, device, gaussians, ANGLES, elevation)
+        photometric = ((rendered.float() - target).abs() * weights).sum() / (weights.sum() * 3)
+        position_prior = position_delta.square().mean()
+        scale_prior = (torch.exp(log_scales) - base_scales).square().mean()
+        loss = photometric + 0.002 * position_prior + 0.002 * scale_prior
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"] + optimizer.param_groups[1]["params"] + optimizer.param_groups[2]["params"] + optimizer.param_groups[3]["params"], 1.0)
+        optimizer.step()
+
+        if step % evaluate_every != 0 and step != steps:
+            continue
+        with torch.no_grad():
+            candidate_gaussians = current_gaussians().detach()
+            candidate_rendered = _render_views(model, opt, device, candidate_gaussians, ANGLES, elevation).detach()
+            candidate_mrc, _ = compute_mrc(
+                target, candidate_rendered, ANGLES, metric=mrc_metric, lpips_model=lpips_model
+            )
+        improved = candidate_mrc["mrc"] < best_mrc["mrc"]
+        if improved:
+            best_gaussians = candidate_gaussians.clone()
+            best_rendered = candidate_rendered.clone()
+            best_mrc = candidate_mrc
+        history.append(
+            {
+                "step": step,
+                "photometric_l1": float(photometric.detach().cpu()),
+                "mrc": candidate_mrc["mrc"],
+                "best_mrc": best_mrc["mrc"],
+                "accepted": improved,
+            }
+        )
+        marker = "new best" if improved else "kept best"
+        print(
+            f"[Refine {step}/{steps}] photo_L1={photometric.detach().item():.6f} "
+            f"MRC={candidate_mrc['mrc']:.6f}; best={best_mrc['mrc']:.6f} ({marker})",
+            flush=True,
+        )
+
+    return best_gaussians, best_rendered, best_mrc, {
+        "enabled": True,
+        "steps": steps,
+        "learning_rate": learning_rate,
+        "evaluate_every": evaluate_every,
+        "objective": "foreground-weighted photometric L1 with bounded LGM Gaussian deltas",
+        "history": history,
+    }
+
+
 def main() -> None:
     args = parse_args()
     import torch
+
+    if args.refine_steps < 0:
+        raise ValueError("--refine-steps cannot be negative")
+    if args.refine_steps and args.prompt:
+        raise ValueError("--refine-steps is for four real input views, not --prompt mode.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = args.checkpoint or args.lgm_root / "pretrained" / "model_fp16_fixrot.safetensors"
@@ -353,6 +509,27 @@ def main() -> None:
     gaussians = best_candidate["gaussians"]
     rendered_tensor = best_candidate["rendered"]
     mrc = best_candidate["mrc"]
+    refinement = {"enabled": False, "steps": 0}
+    if args.refine_steps:
+        print(
+            f"Refining the selected direct reconstruction for {args.refine_steps} steps at "
+            f"{selected_elevation:+.1f}\N{DEGREE SIGN}...",
+            flush=True,
+        )
+        gaussians, rendered_tensor, mrc, refinement = _refine_direct_gaussians(
+            model,
+            opt,
+            device,
+            gaussians,
+            input_tensor,
+            selected_elevation,
+            mrc,
+            args.mrc_metric,
+            lpips_model,
+            args.refine_steps,
+            args.refine_learning_rate,
+            args.refine_eval_every,
+        )
     model.gs.save_ply(gaussians, args.output_dir / "reconstruction.ply")
 
     rendered_np = rendered_tensor.permute(0, 2, 3, 1).float().cpu().numpy()
@@ -378,6 +555,7 @@ def main() -> None:
             "remove_background": args.remove_background,
             "recenter_foreground": args.recenter,
         },
+        "direct_refinement": refinement,
         "source": source_description,
         "mrc": mrc,
     }

@@ -51,3 +51,19 @@ training; this T4 small-batch profile deliberately uses `1e-5` and keeps the
 same `0.2` KL coefficient. The source MVDream/LGM replacement has a different
 architecture and reward implementation, so this is not a claim that the
 resulting weights are compatible with the unavailable Instant3D model.
+
+## Real four-photo refinement
+
+The default Kaggle run now prioritizes the requested real-image task. It
+tries a small common-elevation grid, starts from LGM's best feed-forward
+Gaussian result, and directly optimizes bounded position, opacity, scale, and
+colour deltas across the same four camera views. Its foreground-weighted L1
+objective gives a differentiable fitting signal; LPIPS MRC is evaluated every
+ten steps and only the lowest-MRC Gaussian state is exported. The console line
+`[Refine step/120]` is the progress to judge, not the unrelated prompt-RL
+validation metric.
+
+Prompt RL remains in `code.txt` behind `RUN_PROMPT_RLFT = False` for
+algorithmic research. It is disabled by default because it fine-tunes the
+public MVDream prompt model and cannot change a reconstruction initialized
+from the user's four real images.

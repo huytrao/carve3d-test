@@ -62,6 +62,13 @@ All material pipeline changes are recorded here.
 - Add optional direct-four-view elevation search. The Kaggle profile evaluates
   -10/-5/0/+5/+10 degrees and keeps the reconstruction with lowest same-pose
   LPIPS MRC, recording every candidate in `metrics.json`.
+- Make direct four-photo reconstruction the default Kaggle quality path:
+  LGM's best camera-aligned Gaussian prediction is now refined for 120
+  differentiable, foreground-weighted multi-view fitting steps. Every ten
+  steps it evaluates LPIPS MRC, restores the lowest-MRC Gaussian state, and
+  prints live `[Refine step/120]` progress. Prompt MVDream RL is retained as
+  an explicit optional research stage because it cannot improve this direct
+  reconstruction.
 
 ## Earlier work — `implement_full_pipeline`
 
