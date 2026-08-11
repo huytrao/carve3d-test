@@ -42,16 +42,21 @@ in step 1, but cannot be substituted for MVDream policy samples in steps 2–7:
 policy-gradient replay requires the DDIM states, actions, and log probabilities
 that produced each sample.
 
-When its RLFT switch is enabled, `code.txt` uses the paper-faithful T4 x2
-profile: at most 12 updates, two prompts per update, four stochastic
-trajectories per prompt, and the official public MVDream/LGM setting of 30
-DDIM steps. A reduced Appendix-C.1 curation pass scores eight candidates and
-retains the four highest-MRC (lowest-reward) prompts. Timestep losses are averaged so their scale does not grow with the
-step count. Reward and KL normalization retain a three-appearance per-prompt
-window, matching the paper's approximately three-epoch tracker. Fixed-seed
-validation selects the best LoRA; paper-style KL and validation-plateau early
-stopping replace the former per-update transactional rollback. Four fixed final
-seeds are reported explicitly as inference-time best-of-N selection.
+When its RLFT switch is enabled, `code.txt` uses the paper-style T4 x2 profile:
+at most 30 updates, one prompt per update, eight stochastic trajectories for
+that prompt, and the official public MVDream/LGM setting of 30 DDIM steps. The
+Appendix-C.1 pass scores 30 recreated "complex but not too creative" candidates
+with four base-policy outputs each and retains the ten highest-mean-MRC
+(lowest-reward) prompts. The exact author dataset is not public; the replacement
+and its provenance are explicit in `prompt_sets/paper_style_t4.json`.
+
+Timestep losses are averaged so their scale does not grow with the step count.
+Reward and KL normalization retain a three-appearance per-prompt window. Two
+fixed seeds across four held-out prompts select the best LoRA; paper-style KL
+and validation-plateau early stopping replace the former per-update
+transactional rollback. The final report evaluates the base and best LoRA on
+the same four seeds, reports their paired mean-MRC change, and separately saves
+the lowest-MRC candidate as an inference-time selection.
 
 The paper trained for 55 epochs on 48 A100 80GB GPUs, with batch size 768,
 taking 16.5 hours. Increasing this Kaggle profile further increases cost
@@ -61,8 +66,8 @@ comparable to Carve3DM.
 The LoRA part follows the paper's reported recipe where it is applicable:
 rank 4, frozen fp16 base networks, fp32 LoRA UNet weights, AdamW learning rate
 `3e-4`, and a `0.2` KL coefficient. That `3e-4` was for their batch-768
-training; this T4 small-batch profile uses square-root batch scaling,
-`3e-4 × sqrt(8/768) ≈ 3e-5`, and keeps the same `0.2` KL coefficient. AdamW
+training; this T4 same-prompt batch-8 profile uses `7.5e-5` with validation and
+KL guards, and keeps the same `0.2` KL coefficient. AdamW
 explicitly uses the paper's betas, epsilon,
 and `1e-4` weight decay; relying on PyTorch defaults would use `1e-2` weight
 decay. The source MVDream/LGM replacement has a different architecture and

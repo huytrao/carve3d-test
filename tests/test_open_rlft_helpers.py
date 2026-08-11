@@ -1,10 +1,14 @@
+import json
 import sys
 import unittest
+from collections import Counter
+from pathlib import Path
 from unittest.mock import patch
 
 from open_mvdream_rlft import (
     MVDREAM_TO_LGM,
     PerPromptRunningNormalizer,
+    balanced_prompt_batches,
     grouped_normalized_advantages,
     parse_args,
     resolve_prompt_configuration,
@@ -66,10 +70,12 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertEqual(args.learning_rate, 1e-5)
         self.assertEqual(args.prompts_per_update, 1)
         self.assertEqual(args.curate_prompt_count, 0)
+        self.assertEqual(args.curation_samples_per_prompt, 4)
         self.assertEqual(args.kl_coeff, 0.2)
         self.assertEqual(args.timestep_loss_reduction, "mean")
         self.assertEqual(args.advantage_clip, 5.0)
         self.assertEqual(args.stat_buffer_epochs, 3)
+        self.assertEqual(args.validation_samples_per_prompt, 1)
         self.assertEqual(args.min_validation_improvement, 1e-4)
         self.assertEqual(args.final_candidates, 1)
         self.assertIsNone(args.kl_early_stop_threshold)
@@ -98,6 +104,23 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(second[0], 0.447213, places=5)
         self.assertAlmostEqual(second[1], -1.341639, places=5)
         self.assertEqual(tracker.summary()["chair"]["count"], 4)
+
+    def test_balanced_prompt_schedule_is_reproducible_and_near_uniform(self):
+        prompts = [f"prompt-{index}" for index in range(10)]
+        first = balanced_prompt_batches(prompts, updates=30, prompts_per_update=1, seed=42)
+        second = balanced_prompt_batches(prompts, updates=30, prompts_per_update=1, seed=42)
+        self.assertEqual(first, second)
+        counts = Counter(prompt for batch in first for prompt in batch)
+        self.assertEqual(set(counts.values()), {3})
+
+    def test_checked_in_t4_prompt_set_is_unique_and_holds_out_final_target(self):
+        prompt_set_path = Path(__file__).parents[1] / "prompt_sets" / "paper_style_t4.json"
+        prompt_set = json.loads(prompt_set_path.read_text(encoding="utf-8"))
+        candidates = prompt_set["training_candidates"]
+        self.assertEqual(len(candidates), 30)
+        self.assertEqual(len(set(candidates)), 30)
+        self.assertNotIn(prompt_set["final_prompt"], candidates)
+        self.assertEqual(len(prompt_set["validation_prompts"]), 4)
 
 
 if __name__ == "__main__":

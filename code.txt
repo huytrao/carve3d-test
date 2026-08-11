@@ -9,6 +9,7 @@
 # checkpoint and sparse-view LRM are not released. The repository records this
 # honestly in docs/OPEN_RLFT.md and uses public MVDream + LGM instead.
 
+import json
 import os
 import subprocess
 import sys
@@ -28,7 +29,7 @@ LGM_ROOT = WORKDIR / "LGM"
 INPUT_DIR = Path(os.environ.get("CARVE3D_INPUT_DIR", "/kaggle/input/datasets/traoanhuy/carve3d/views"))
 INPUT_DIR_FALLBACKS = (Path("/kaggle/input/carve3d/views"),)
 DIRECT_OUTPUT_DIR = WORKDIR / "carve3d-direct-four-view-calibrated-output"
-RLFT_OUTPUT_DIR = WORKDIR / "carve3d-paper-faithful-t4x2-output-v6"
+RLFT_OUTPUT_DIR = WORKDIR / "carve3d-paper-style-t4x2-output-v7"
 
 # This is the safe path for YOUR four photographs. It starts from LGM's
 # Gaussian prediction, then tests forward-only global colour/opacity/scale
@@ -44,51 +45,39 @@ RUN_DIRECT_RECONSTRUCTION = False  # Enable only when a fresh direct PLY is also
 # GPU 1 holds LGM/MRC.
 RUN_PROMPT_RLFT = True
 
-# Paper-faithful T4 x2 profile. It preserves pure on-policy REINFORCE, rank-4
+# Paper-style T4 x2 profile. It preserves pure on-policy REINFORCE, rank-4
 # fp32 LoRA, reward/KL per-prompt normalization, AdamW, and KL early stopping.
-# Instant3D used batch 768 and lr=3e-4. With batch 8, square-root batch scaling
-# gives about 3e-5: substantially faster than the old 1e-5 profile without
-# pretending two T4s can reproduce 48 A100s.
-RL_EPOCHS = 12
+# Instant3D used batch 768 and lr=3e-4. T4 cannot reproduce that scale, so this
+# profile spends its batch on one prompt at a time (8 independent trajectories)
+# and uses 7.5e-5 with validation/KL guards. Thirty updates give each of the ten
+# curated prompts exactly three appearances, matching the paper's stat window.
+RL_EPOCHS = 30
 RL_SAMPLES_PER_EPOCH = 8
-RL_PROMPTS_PER_UPDATE = 2
-RL_CURATE_PROMPT_COUNT = 4
+RL_PROMPTS_PER_UPDATE = 1
+RL_CURATE_PROMPT_COUNT = 10
+RL_CURATION_SAMPLES_PER_PROMPT = 4  # Exact Appendix C.1 ranking rule.
 RL_DDIM_STEPS = 30  # Official public MVDream/LGM text pipeline setting.
 RL_GUIDANCE_SCALE = 5.0  # Matches the paper; also supported by public MVDream.
-RL_LEARNING_RATE = 3e-5
+RL_LEARNING_RATE = 7.5e-5
 RL_REWARD_COEFF = 1.0
 RL_KL_COEFF = 0.2
 RL_TIMESTEP_REDUCTION = "mean"
 RL_ADVANTAGE_CLIP = 5.0
 RL_STAT_BUFFER_EPOCHS = 3
 RL_KL_EARLY_STOP_THRESHOLD = 3.2e-4  # Paper value; logged explicitly because model scale differs.
-RL_MIN_VALIDATION_IMPROVEMENT = 0.0
+RL_MIN_VALIDATION_IMPROVEMENT = 5e-4
 RL_MRC_METRIC = "lpips"  # Paper metric. Use "l1" only when LPIPS download is blocked.
-RL_EARLY_STOP_PATIENCE = 4
+RL_VALIDATION_EVERY = 5
+RL_VALIDATION_SAMPLES_PER_PROMPT = 2
+RL_EARLY_STOP_PATIENCE = 3
 FINAL_CANDIDATES = 4
 
-# Paper training uses a curated set of low-reward, complex-but-not-too-creative
-# prompts and evaluates held-out prompts. The released main branch leaves that
-# dataset as TODO, so this public profile supplies an explicit small curriculum.
-# The staircase is held out for final evaluation; it is not a training prompt.
-FINAL_EVAL_PROMPT = (
-    "a freestanding gray steel five-step industrial staircase, black anti-slip rectangular treads, "
-    "triangular cross-braced frame, isolated studio product photograph, white background"
-)
-TRAIN_PROMPTS = [
-    "a vintage sewing machine with a large hand wheel and metal foot pedal, isolated studio product photo, white background",
-    "a compact red construction crane toy with a lattice boom and four wheels, isolated on white",
-    "an ornate brass table lamp with a pleated fabric shade and curved support arm, studio product photograph",
-    "a blue camping stove with two burners, control knobs and folding wind guards, isolated on white",
-    "a wooden rocking horse with curved runners, leather saddle and carved handles, studio product photograph",
-    "a small green garden cart with two wheels, metal frame and wooden handle, isolated white background",
-    "a retro film projector with twin reels, lens barrel and folding support feet, product photo on white",
-    "a ceramic countertop mixer with a stainless bowl and raised mixing head, isolated studio photograph",
-]
-VALIDATION_PROMPTS = [
-    FINAL_EVAL_PROMPT,
-    "a folding metal workshop ladder with wide black treads and diagonal braces, isolated studio product photograph",
-]
+# Appendix C.1 says the final prompts were generated with GPT-4 and curated by
+# base reward, but the exact dataset is still a TODO in the authors' repository.
+# This checked-in replacement follows their "complex but not too creative"
+# recipe. It deliberately avoids repeating product-photo/white-background style
+# tokens in every sample and keeps the staircase held out from RL updates.
+PROMPT_SET_RELATIVE_PATH = Path("prompt_sets/paper_style_t4.json")
 
 # Public model downloads and package setup stay quiet; actual metrics/errors are
 # intentionally shown. GPU 0 is MVDream/RL; GPU 1 is LGM/MRC.
@@ -131,6 +120,8 @@ if RUN_PROMPT_RLFT:
         "--stat-buffer-epochs",
         "--kl-early-stop-threshold",
         "--curate-prompt-count",
+        "--curation-samples-per-prompt",
+        "--validation-samples-per-prompt",
     )
     missing_options = [option for option in required_options if option not in rlft_help]
     if missing_options:
@@ -139,6 +130,20 @@ if RUN_PROMPT_RLFT:
             + ", ".join(missing_options)
             + ". Commit and push the updated runner before starting this cell."
         )
+
+prompt_set_path = REPO / PROMPT_SET_RELATIVE_PATH
+prompt_set = json.loads(prompt_set_path.read_text(encoding="utf-8"))
+TRAIN_PROMPTS = prompt_set["training_candidates"]
+VALIDATION_PROMPTS = prompt_set["validation_prompts"]
+FINAL_EVAL_PROMPT = prompt_set["final_prompt"]
+if len(TRAIN_PROMPTS) != 30 or len(set(TRAIN_PROMPTS)) != 30:
+    raise RuntimeError(f"Expected 30 unique curation candidates in {prompt_set_path}")
+if FINAL_EVAL_PROMPT in TRAIN_PROMPTS:
+    raise RuntimeError("The final staircase prompt must remain held out from RL training")
+print(
+    f"Loaded paper-style prompt set: {len(TRAIN_PROMPTS)} curation candidates, "
+    f"select {RL_CURATE_PROMPT_COUNT}; {len(VALIDATION_PROMPTS)} held-out validation prompts."
+)
 
 def run_direct_reconstruction() -> None:
     global INPUT_DIR
@@ -223,6 +228,7 @@ rlft_command = [
     "--samples-per-epoch", str(RL_SAMPLES_PER_EPOCH),
     "--prompts-per-update", str(RL_PROMPTS_PER_UPDATE),
     "--curate-prompt-count", str(RL_CURATE_PROMPT_COUNT),
+    "--curation-samples-per-prompt", str(RL_CURATION_SAMPLES_PER_PROMPT),
     "--num-steps", str(RL_DDIM_STEPS),
     "--guidance-scale", str(RL_GUIDANCE_SCALE),
     "--learning-rate", str(RL_LEARNING_RATE),
@@ -234,6 +240,8 @@ rlft_command = [
     "--kl-early-stop-threshold", str(RL_KL_EARLY_STOP_THRESHOLD),
     "--min-validation-improvement", str(RL_MIN_VALIDATION_IMPROVEMENT),
     "--mrc-metric", RL_MRC_METRIC,
+    "--validation-every", str(RL_VALIDATION_EVERY),
+    "--validation-samples-per-prompt", str(RL_VALIDATION_SAMPLES_PER_PROMPT),
     "--early-stop-patience", str(RL_EARLY_STOP_PATIENCE),
     "--final-candidates", str(FINAL_CANDIDATES),
     # Pass this explicitly for compatibility with both the old Kaggle branch
@@ -245,7 +253,10 @@ for prompt in TRAIN_PROMPTS:
 for prompt in VALIDATION_PROMPTS:
     rlft_command.extend(["--validation-prompt", prompt])
 if RUN_PROMPT_RLFT:
-    print("Starting paper-style public RLFT. This output is separate from the four-photo reconstruction.")
+    print(
+        "Starting paper-style public RLFT: 30 candidates x 4 curation samples, "
+        "10 selected prompts, 8 same-prompt trajectories/update."
+    )
     subprocess.run(rlft_command, check=True)
 else:
     print(

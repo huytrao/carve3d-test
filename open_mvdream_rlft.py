@@ -101,8 +101,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Before RL, score every explicit training prompt once with the base policy and retain this many "
+            "Before RL, score every explicit training prompt with the base policy and retain this many "
             "highest-MRC prompts. Zero disables the paper-style low-reward prompt curation."
+        ),
+    )
+    parser.add_argument(
+        "--curation-samples-per-prompt",
+        type=int,
+        default=4,
+        help=(
+            "Independent base-policy outputs averaged for each curation candidate. Carve3D Appendix C.1 uses 4; "
+            "reducing this makes ranking faster but noisier."
         ),
     )
     parser.add_argument("--num-steps", type=int, default=30, help="DDIM denoising steps.")
@@ -171,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="validation_prompts",
         help="Held-out prompt for best-checkpoint selection. Repeat for multiple prompts.",
+    )
+    parser.add_argument(
+        "--validation-samples-per-prompt",
+        type=int,
+        default=1,
+        help="Fixed seeds evaluated per held-out prompt. Use at least 2 for less noisy T4 checkpoint selection.",
     )
     parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
     parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
@@ -706,6 +721,39 @@ def grouped_normalized_advantages(
     return result.tolist()
 
 
+def balanced_prompt_batches(
+    prompts: Sequence[str], updates: int, prompts_per_update: int, seed: int
+) -> list[list[str]]:
+    """Build reproducible shuffled prompt batches with near-uniform coverage.
+
+    The paper samples training prompts rather than walking a fixed difficulty
+    ranking.  At T4 scale, purely random draws can omit a prompt for most of a
+    short run, so shuffled cycles preserve randomness while keeping prompt
+    counts within one occurrence of each other.
+    """
+
+    unique_prompts = list(dict.fromkeys(prompts))
+    if updates < 1 or prompts_per_update < 1:
+        raise ValueError("updates and prompts_per_update must be positive")
+    if len(unique_prompts) < prompts_per_update:
+        raise ValueError("not enough distinct prompts for one update")
+    rng = np.random.default_rng(seed)
+    pool: list[str] = []
+    batches: list[list[str]] = []
+    for _ in range(updates):
+        batch: list[str] = []
+        while len(batch) < prompts_per_update:
+            if not pool:
+                pool = [unique_prompts[index] for index in rng.permutation(len(unique_prompts))]
+            candidate = pool.pop(0)
+            if candidate in batch:
+                pool.append(candidate)
+                continue
+            batch.append(candidate)
+        batches.append(batch)
+    return batches
+
+
 class PerPromptRunningNormalizer:
     """Paper/DDPO per-prompt statistics retained across on-policy updates."""
 
@@ -878,35 +926,101 @@ def evaluate_prompts(
     seed: int,
     device: Any,
     args: argparse.Namespace,
+    samples_per_prompt: int = 1,
+    label: str = "Validation",
 ) -> dict[str, Any]:
-    """Generate fixed-seed held-out prompts and return their mean MRC."""
+    """Evaluate prompts over fixed independent seeds and aggregate per prompt.
+
+    Appendix C.1 ranks curation prompts by the average of four base-policy
+    outputs.  The same aggregation also makes small held-out validation less
+    sensitive to one unusually easy or difficult seed.
+    """
+
+    if samples_per_prompt < 1:
+        raise ValueError("samples_per_prompt must be at least 1")
 
     was_training = pipe.unet.training
     pipe.unet.eval()
     records: list[dict[str, Any]] = []
-    for index, prompt in enumerate(prompts):
-        trajectory = sample_trajectory(
-            pipe,
-            prompt,
-            seed + index,
-            device,
-            args.num_steps,
-            args.guidance_scale,
-            args.eta,
-            args.elevation,
-        )
-        score_and_save(trajectory, scorer, destination / f"prompt_{index:02d}")
+    executor_context = ThreadPoolExecutor(max_workers=1) if args.overlap_reward else nullcontext(None)
+    pending_scores: list[tuple[int, int, Trajectory, Future[Any]]] = []
+
+    def finish_score(
+        prompt_index: int,
+        sample_index: int,
+        trajectory: Trajectory,
+        future: Future[Any] | None = None,
+    ) -> None:
+        if future is not None:
+            future.result()
         records.append(
             {
-                "prompt": prompt,
+                "prompt_index": prompt_index,
+                "sample_index": sample_index,
+                "prompt": trajectory.prompt,
                 "seed": trajectory.seed,
                 "mrc": trajectory.mrc,
                 "kl_to_base": trajectory.kl_to_base,
             }
         )
+        print(
+            f"[{label}] prompt {prompt_index + 1}/{len(prompts)} sample "
+            f"{sample_index + 1}/{samples_per_prompt} MRC={trajectory.mrc:.6f} "
+            f"KL_base={trajectory.kl_to_base:.6f}",
+            flush=True,
+        )
+
+    with executor_context as reward_executor:
+        for prompt_index, prompt in enumerate(prompts):
+            for sample_index in range(samples_per_prompt):
+                trajectory_seed = seed + prompt_index * samples_per_prompt + sample_index
+                trajectory = sample_trajectory(
+                    pipe,
+                    prompt,
+                    trajectory_seed,
+                    device,
+                    args.num_steps,
+                    args.guidance_scale,
+                    args.eta,
+                    args.elevation,
+                )
+                sample_destination = (
+                    destination / f"prompt_{prompt_index:02d}" / f"sample_{sample_index:02d}"
+                )
+                if reward_executor is None:
+                    score_and_save(trajectory, scorer, sample_destination)
+                    finish_score(prompt_index, sample_index, trajectory)
+                else:
+                    future = reward_executor.submit(score_and_save, trajectory, scorer, sample_destination)
+                    pending_scores.append((prompt_index, sample_index, trajectory, future))
+                    if len(pending_scores) > 1:
+                        finish_score(*pending_scores.pop(0))
+        while pending_scores:
+            finish_score(*pending_scores.pop(0))
+
+    records.sort(key=lambda record: (record["prompt_index"], record["sample_index"]))
+    prompt_records: list[dict[str, Any]] = []
+    for prompt_index, prompt in enumerate(prompts):
+        prompt_samples = [record for record in records if record["prompt_index"] == prompt_index]
+        prompt_records.append(
+            {
+                "prompt_index": prompt_index,
+                "prompt": prompt,
+                "mean_mrc": float(np.mean([record["mrc"] for record in prompt_samples])),
+                "std_mrc": float(np.std([record["mrc"] for record in prompt_samples])),
+                "mean_kl_to_base": float(np.mean([record["kl_to_base"] for record in prompt_samples])),
+                "samples": prompt_samples,
+            }
+        )
     mean_mrc = float(np.mean([record["mrc"] for record in records]))
     mean_kl_to_base = float(np.mean([record["kl_to_base"] for record in records]))
-    result = {"mean_mrc": mean_mrc, "mean_kl_to_base": mean_kl_to_base, "records": records}
+    result = {
+        "samples_per_prompt": samples_per_prompt,
+        "mean_mrc": mean_mrc,
+        "mean_kl_to_base": mean_kl_to_base,
+        "prompt_records": prompt_records,
+        "records": records,
+    }
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     if was_training:
@@ -919,6 +1033,10 @@ def evaluate_final_candidates(
     scorer: LgmMrcScorer,
     device: Any,
     args: argparse.Namespace,
+    *,
+    candidates_directory: str = "final_candidates",
+    publish_best: bool = True,
+    label: str = "Final",
 ) -> dict[str, Any]:
     """Score final fixed-seed samples and retain the best reconstruction-consistent one.
 
@@ -929,7 +1047,7 @@ def evaluate_final_candidates(
 
     if args.final_candidates < 1:
         raise ValueError("--final-candidates must be at least 1")
-    candidates_root = args.output_dir / "final_candidates"
+    candidates_root = args.output_dir / candidates_directory
     records: list[dict[str, Any]] = []
     best_path: Path | None = None
     best_trajectory: Trajectory | None = None
@@ -950,7 +1068,7 @@ def evaluate_final_candidates(
         record = {"index": index, "seed": seed, "mrc": trajectory.mrc, "reward_negative_mrc": trajectory.reward}
         records.append(record)
         print(
-            f"[Final {index + 1}/{args.final_candidates}] MRC={trajectory.mrc:.6f}",
+            f"[{label} {index + 1}/{args.final_candidates}] MRC={trajectory.mrc:.6f}",
             flush=True,
         )
         if best_trajectory is None or trajectory.mrc < best_trajectory.mrc:
@@ -958,17 +1076,22 @@ def evaluate_final_candidates(
             best_path = candidate_path
 
     assert best_trajectory is not None and best_path is not None
-    final_destination = args.output_dir / "final_evaluation"
-    shutil.rmtree(final_destination, ignore_errors=True)
-    shutil.copytree(best_path, final_destination)
     result = {
         "selection": "lowest_mrc_over_fixed_seed_candidates",
         "candidate_count": args.final_candidates,
         "prompt": args.final_prompt,
+        "mean_mrc": float(np.mean([record["mrc"] for record in records])),
+        "std_mrc": float(np.std([record["mrc"] for record in records])),
         "selected": min(records, key=lambda record: record["mrc"]),
         "candidates": records,
     }
-    (final_destination / "selection.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    candidates_root.mkdir(parents=True, exist_ok=True)
+    (candidates_root / "selection.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if publish_best:
+        final_destination = args.output_dir / "final_evaluation"
+        shutil.rmtree(final_destination, ignore_errors=True)
+        shutil.copytree(best_path, final_destination)
+        (final_destination / "selection.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
 
@@ -982,6 +1105,8 @@ def main() -> None:
         raise ValueError("--prompts-per-update must be at least 1")
     if args.curate_prompt_count < 0:
         raise ValueError("--curate-prompt-count cannot be negative")
+    if args.curation_samples_per_prompt < 1:
+        raise ValueError("--curation-samples-per-prompt must be at least 1")
     if args.samples_per_epoch % args.prompts_per_update != 0:
         raise ValueError("--samples-per-epoch must divide evenly by --prompts-per-update")
     samples_per_prompt = args.samples_per_epoch // args.prompts_per_update
@@ -991,6 +1116,8 @@ def main() -> None:
         raise ValueError("--num-steps must be at least 2")
     if args.validation_every < 1 or args.early_stop_patience < 1:
         raise ValueError("--validation-every and --early-stop-patience must be at least 1")
+    if args.validation_samples_per_prompt < 1:
+        raise ValueError("--validation-samples-per-prompt must be at least 1")
     if args.min_validation_improvement < 0:
         raise ValueError("--min-validation-improvement cannot be negative")
     if args.advantage_clip <= 0:
@@ -1040,7 +1167,8 @@ def main() -> None:
             raise ValueError("--curate-prompt-count cannot exceed the number of distinct training prompts")
         print(
             f"[Curation] scoring {len(curation_candidates)} base-policy prompts; selecting "
-            f"{args.curate_prompt_count} with highest MRC...",
+            f"{args.curate_prompt_count} with highest mean MRC over "
+            f"{args.curation_samples_per_prompt} samples/prompt...",
             flush=True,
         )
         curation_evaluation = evaluate_prompts(
@@ -1051,19 +1179,44 @@ def main() -> None:
             args.seed + 2_000_000,
             diffusion_device,
             args,
+            samples_per_prompt=args.curation_samples_per_prompt,
+            label="Curation",
         )
-        ranked = sorted(curation_evaluation["records"], key=lambda record: record["mrc"], reverse=True)
+        ranked = sorted(
+            curation_evaluation["prompt_records"],
+            key=lambda record: record["mean_mrc"],
+            reverse=True,
+        )
         prompts = [record["prompt"] for record in ranked[: args.curate_prompt_count]]
         curation = {
             "enabled": True,
-            "criterion": "highest base-policy MRC (lowest reward)",
-            "samples_per_candidate": 1,
-            "candidates": curation_evaluation["records"],
+            "criterion": "highest base-policy mean MRC over independent outputs (lowest mean reward)",
+            "samples_per_candidate": args.curation_samples_per_prompt,
+            "candidates": curation_evaluation["prompt_records"],
             "selected": list(prompts),
         }
         for index, record in enumerate(ranked, start=1):
             marker = "selected" if record["prompt"] in prompts else "not selected"
-            print(f"[Curation] rank {index}: MRC={record['mrc']:.6f} ({marker}) {record['prompt']}", flush=True)
+            print(
+                f"[Curation] rank {index}: mean_MRC={record['mean_mrc']:.6f} "
+                f"std={record['std_mrc']:.6f} ({marker}) {record['prompt']}",
+                flush=True,
+            )
+    prompt_batches = balanced_prompt_batches(
+        prompts,
+        args.epochs,
+        args.prompts_per_update,
+        args.seed + 17_003,
+    )
+    prompt_occurrences = {
+        prompt: sum(prompt in batch for batch in prompt_batches)
+        for prompt in prompts
+    }
+    print(
+        "[Prompt schedule] balanced shuffled curriculum: "
+        + ", ".join(f"{count}x {prompt}" for prompt, count in prompt_occurrences.items()),
+        flush=True,
+    )
     stat_buffer_size = samples_per_prompt * args.stat_buffer_epochs
     reward_stat_tracker = PerPromptRunningNormalizer(stat_buffer_size, samples_per_prompt)
     kl_stat_tracker = PerPromptRunningNormalizer(stat_buffer_size, samples_per_prompt)
@@ -1077,6 +1230,17 @@ def main() -> None:
         validation_seed,
         diffusion_device,
         args,
+        samples_per_prompt=args.validation_samples_per_prompt,
+        label="Baseline validation",
+    )
+    baseline_final_selection = evaluate_final_candidates(
+        pipe,
+        scorer,
+        diffusion_device,
+        args,
+        candidates_directory="baseline_final_candidates",
+        publish_best=False,
+        label="Baseline final",
     )
     best_validation_mrc = baseline_validation["mean_mrc"]
     best_epoch = -1
@@ -1112,25 +1276,30 @@ def main() -> None:
         # Mix several prompts per update, but normalize reward/KL within each
         # prompt as Carve3D/DDPO requires. Cycling prompts across updates means
         # an object category is revisited instead of receiving one update only.
-        epoch_prompts = [
-            prompts[(epoch * args.prompts_per_update + index) % len(prompts)]
-            for index in range(args.prompts_per_update)
-        ]
+        epoch_prompts = prompt_batches[epoch]
         print(
             f"[RL {epoch + 1}/{args.epochs}] sampling {args.samples_per_epoch} trajectories "
             f"across {args.prompts_per_update} prompt(s)",
             flush=True,
         )
         executor_context = ThreadPoolExecutor(max_workers=1) if args.overlap_reward else nullcontext(None)
-        pending_scores: list[tuple[int, Trajectory, Future[Any]]] = []
+        pending_scores: list[tuple[int, int, int, Trajectory, Future[Any]]] = []
 
-        def finish_score(sample_index: int, trajectory: Trajectory, future: Future[Any] | None = None) -> None:
+        def finish_score(
+            sample_index: int,
+            prompt_index: int,
+            prompt_sample_index: int,
+            trajectory: Trajectory,
+            future: Future[Any] | None = None,
+        ) -> None:
             if future is not None:
                 future.result()
             trajectories.append(trajectory)
             completed = len(trajectories)
             print(
                 f"[RL {epoch + 1}/{args.epochs}] sample {completed}/{args.samples_per_epoch} "
+                f"prompt={prompt_index + 1}/{args.prompts_per_update} "
+                f"trajectory={prompt_sample_index + 1}/{samples_per_prompt} seed={trajectory.seed} "
                 f"MRC={trajectory.mrc:.6f} KL_base={trajectory.kl_to_base:.6f}",
                 flush=True,
             )
@@ -1174,10 +1343,12 @@ def main() -> None:
                     )
                     if reward_executor is None:
                         score_and_save(trajectory, scorer, destination)
-                        finish_score(sample_index, trajectory)
+                        finish_score(sample_index, prompt_index, prompt_sample_index, trajectory)
                     else:
                         future = reward_executor.submit(score_and_save, trajectory, scorer, destination)
-                        pending_scores.append((sample_index, trajectory, future))
+                        pending_scores.append(
+                            (sample_index, prompt_index, prompt_sample_index, trajectory, future)
+                        )
                         # Keep at most one score queued behind the active GPU-1
                         # job while GPU 0 samples the next trajectory.
                         if len(pending_scores) > 1:
@@ -1249,6 +1420,8 @@ def main() -> None:
                 validation_seed,
                 diffusion_device,
                 args,
+                samples_per_prompt=args.validation_samples_per_prompt,
+                label=f"Validation {epoch + 1}",
             )
             epoch_record["validation_mrc"] = validation["mean_mrc"]
             epoch_record["validation_kl_to_base"] = validation["mean_kl_to_base"]
@@ -1344,6 +1517,20 @@ def main() -> None:
     restore_lora(pipe.unet, best_state)
     pipe.unet.eval()
     final_selection = evaluate_final_candidates(pipe, scorer, diffusion_device, args)
+    final_selection["paired_mean_mrc_improvement"] = (
+        baseline_final_selection["mean_mrc"] - final_selection["mean_mrc"]
+    )
+    for selection_path in (
+        args.output_dir / "final_candidates" / "selection.json",
+        args.output_dir / "final_evaluation" / "selection.json",
+    ):
+        selection_path.write_text(json.dumps(final_selection, indent=2), encoding="utf-8")
+    print(
+        f"[Final comparison] same-seed mean MRC: base={baseline_final_selection['mean_mrc']:.6f} "
+        f"post_RL={final_selection['mean_mrc']:.6f} "
+        f"improvement={final_selection['paired_mean_mrc_improvement']:.6f}",
+        flush=True,
+    )
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "lora_final.pt")
     metadata = {
         "pipeline": "open-mvdream-lgm-mrc-on-policy-lora-rlft",
@@ -1362,6 +1549,12 @@ def main() -> None:
             "samples_per_epoch": args.samples_per_epoch,
             "prompts_per_update": args.prompts_per_update,
             "prompt_curation": curation,
+            "prompt_schedule": {
+                "method": "seeded balanced shuffled cycles",
+                "occurrences": prompt_occurrences,
+                "batches": prompt_batches,
+            },
+            "curation_samples_per_prompt": args.curation_samples_per_prompt,
             "ddim_steps": args.num_steps,
             "eta": args.eta,
             "timestep_loss_reduction": args.timestep_loss_reduction,
@@ -1374,6 +1567,7 @@ def main() -> None:
                 "kl_to_base": kl_stat_tracker.summary(),
             },
             "validation_every": args.validation_every,
+            "validation_samples_per_prompt": args.validation_samples_per_prompt,
             "early_stop_patience": args.early_stop_patience,
             "kl_early_stop_threshold": args.kl_early_stop_threshold,
             "min_validation_improvement": args.min_validation_improvement,
@@ -1392,6 +1586,7 @@ def main() -> None:
             "final": args.final_prompt,
         },
         "baseline_validation": baseline_validation,
+        "baseline_final_selection": baseline_final_selection,
         "best_validation_mrc": best_validation_mrc,
         "best_epoch": best_epoch,
         "training_stop_reason": training_stop_reason,
@@ -1408,6 +1603,8 @@ def main() -> None:
         best_epoch=best_epoch,
         best_validation_mrc=best_validation_mrc,
         final_mrc=final_selection["selected"]["mrc"],
+        final_mean_mrc=final_selection["mean_mrc"],
+        paired_mean_mrc_improvement=final_selection["paired_mean_mrc_improvement"],
         training_stop_reason=training_stop_reason,
     )
     print(f"\nCompleted open RLFT. Results: {args.output_dir.resolve()}")

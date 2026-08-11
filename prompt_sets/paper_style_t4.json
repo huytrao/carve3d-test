@@ -1,0 +1,43 @@
+{
+  "name": "paper-style-complex-not-too-creative-t4",
+  "provenance": "Recreated from the prompt preparation recipe in Carve3D Appendix C.1; the authors' exact prompt dataset remains unreleased.",
+  "training_candidates": [
+    "a teddy bear pushing a shopping cart filled with fruit and vegetables",
+    "a vintage sewing machine with a large hand wheel, thread spool, needle arm, and metal foot pedal",
+    "a red construction crane truck with a lattice boom, four wheels, stabilizer legs, and a hanging hook",
+    "a blue two-burner camping stove with control knobs, a fuel canister, and folding wind guards",
+    "a wooden rocking horse with curved runners, a leather saddle, carved handles, and a short tail",
+    "a green garden cart carrying a watering can and hand tools, with two wheels and a long wooden handle",
+    "a retro film projector with two large reels, a lens barrel, side controls, and folding support feet",
+    "a mechanical typewriter with raised keys, a paper sheet, twin ribbon spools, and a carriage return lever",
+    "a red fire engine with an extended ladder, side compartments, coiled hoses, and six wheels",
+    "a city bicycle with a front basket, rear child seat, kickstand, pedals, and a chain guard",
+    "a stainless espresso machine with a portafilter, steam wand, pressure gauge, and two ceramic cups",
+    "a tall wooden grandfather clock with a round face, visible pendulum, carved base, and side columns",
+    "a metal desk fan with a circular safety cage, five blades, control buttons, and an adjustable stand",
+    "a brass telescope mounted on a wooden tripod with adjustment knobs and a small finder scope",
+    "a compact drum kit with a bass drum, snare, two toms, cymbals, pedals, and a stool",
+    "a charcoal barbecue grill with an open lid, side shelf, lower rack, two wheels, and cooking tools",
+    "a yellow forklift carrying a wooden crate, with raised forks, an overhead guard, and four black tires",
+    "a wooden record player with an open lid, vinyl disc, tonearm, speaker grille, and control knobs",
+    "a laboratory microscope with twin eyepieces, objective lenses, a specimen stage, and focus wheels",
+    "an antique cash register with round keys, a receipt roll, a price display, and an open coin drawer",
+    "a yellow tracked excavator with an articulated boom, hydraulic cylinders, bucket, and enclosed cab",
+    "a child's red tricycle with a front basket, chrome handlebars, pedals, rear step, and a small bell",
+    "a kerosene lantern with a glass chamber, protective wire cage, fuel tank, handle, and control dial",
+    "an open metal toolbox containing a hammer, wrench, screwdriver, pliers, and a folded measuring tape",
+    "a wooden workbench with a mounted vise, lower shelf, hand saw, mallet, and several storage drawers",
+    "a delivery robot carrying two stacked parcels, with articulated arms, a sensor head, and four wheels",
+    "a vintage camera on a folding tripod with a bellows lens, flash reflector, cable release, and leather case",
+    "a ceramic teapot on a serving tray with two cups, a sugar bowl, curved handles, and matching lids",
+    "a small fishing boat with an outboard motor, two seats, oars, a coiled rope, and an anchor",
+    "a green farm tractor pulling a small two-wheel trailer loaded with wooden crates"
+  ],
+  "validation_prompts": [
+    "a freestanding gray steel five-step industrial staircase with black anti-slip treads and a triangular cross-braced frame",
+    "a vintage motorcycle with a sidecar, round headlamp, exposed engine, exhaust pipes, and spoked wheels",
+    "a service robot holding a tea tray with a teapot and two cups, with articulated arms and wheeled feet",
+    "a wooden artist easel holding a framed canvas, with a paint palette, brushes, and an adjustable rear support"
+  ],
+  "final_prompt": "a freestanding gray steel five-step industrial staircase with black anti-slip rectangular treads, triangular cross-braced frame, and flat stabilizing feet"
+}

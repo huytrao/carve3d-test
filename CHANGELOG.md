@@ -83,9 +83,10 @@ All material pipeline changes are recorded here.
   returned to the next denoising step, average the small-batch T4 loss over
   stochastic timesteps, keep sample/replay in UNet eval mode, and print replay
   log-probability error to expose policy mismatches and gradient spikes.
-- Mix two prompts per update with four trajectories each, clip advantages at
-  5, require a material validation improvement before accepting an update,
-  and use held-out categories instead of the previous toy-car overlap.
+- Use all eight T4 trajectories for one prompt per update, clip advantages at
+  5, and schedule selected prompts through seeded shuffled cycles. Sample logs
+  now include the prompt slot, within-prompt trajectory index, and seed so
+  overlapped GPU reward output cannot be mistaken for an uneven batch.
 - Match the public LGM text pipeline by removing MVDream backgrounds,
   recentering foregrounds, and compositing on white before reward
   reconstruction. The reusable rembg session is pinned to ONNX CPU to avoid
@@ -102,13 +103,18 @@ All material pipeline changes are recorded here.
   an explicit `--target-prompt` or `--prompt`, resolves validation/final prompts
   from that same configuration, and fails before model loading if the prompt
   setup is missing or inconsistent.
-- Add a paper-faithful Kaggle T4 x2 profile: general low-reward-style training
-  prompts with the steel staircase held out, rank-4 fp32 LoRA, batch-scaled
-  `3e-5` learning rate, persistent three-appearance reward/KL statistics, and
+- Add a paper-style Kaggle T4 x2 profile: general low-reward-style training
+  prompts with the steel staircase held out, rank-4 fp32 LoRA, guarded
+  `7.5e-5` learning rate, persistent three-appearance reward/KL statistics, and
   paper-style validation-KL early stopping. Per-update transactional rollback
   is no longer used by the one-cell profile.
-- Add reduced paper Appendix-C.1 prompt curation: score eight candidates with
-  the base policy and train the four with highest MRC/lowest reward.
+- Recreate the unreleased Appendix-C.1 dataset recipe as 30 checked-in
+  "complex but not too creative" candidates. Rank every candidate by the mean
+  of four base-policy outputs, as specified by the paper, then train the ten
+  with highest MRC/lowest reward for three balanced appearances each.
+- Validate four held-out prompts with two fixed seeds each and compare base
+  versus best-LoRA final MRC on the same four seeds. The paired mean is reported
+  separately from inference-time best-of-four selection.
 - Pipeline GPU-0 MVDream sampling with GPU-1 LGM/MRC scoring through
   `--overlap-reward`, increasing dual-T4 utilization without changing the
   sampled trajectories or on-policy objective.
