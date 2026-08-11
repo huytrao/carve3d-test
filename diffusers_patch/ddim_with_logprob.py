@@ -21,8 +21,13 @@ def _left_broadcast(t, shape):
 
 def _get_variance(self, timestep, prev_timestep):
     alpha_prod_t = torch.gather(self.alphas_cumprod, 0, timestep.cpu()).to(timestep.device)
+    # ``torch.where`` evaluates both branches, so indexing with a negative
+    # final DDIM timestep would fail even though the final-alpha branch should
+    # be selected. Clamp only for the gather and retain the original sign for
+    # the condition.
+    prev_index = prev_timestep.cpu().clamp(0, self.config.num_train_timesteps - 1)
     alpha_prod_t_prev = torch.where(
-        prev_timestep.cpu() >= 0, self.alphas_cumprod.gather(0, prev_timestep.cpu()), self.final_alpha_cumprod
+        prev_timestep.cpu() >= 0, self.alphas_cumprod.gather(0, prev_index), self.final_alpha_cumprod
     ).to(timestep.device)
     beta_prod_t = 1 - alpha_prod_t
     beta_prod_t_prev = 1 - alpha_prod_t_prev
@@ -87,13 +92,16 @@ def ddim_step_with_logprob(
 
     # 1. get previous step value (=t-1)
     prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
-    # to prevent OOB on gather
-    prev_timestep = torch.clamp(prev_timestep, 0, self.config.num_train_timesteps - 1)
+    # Use a safe gather index while preserving ``prev_timestep < 0`` so the
+    # final action uses ``final_alpha_cumprod`` as DDIM specifies.
+    prev_timestep_index = torch.clamp(prev_timestep, 0, self.config.num_train_timesteps - 1)
 
     # 2. compute alphas, betas  TODO why gather on cpu?
     alpha_prod_t = self.alphas_cumprod.gather(0, timestep.cpu())
     alpha_prod_t_prev = torch.where(
-        prev_timestep.cpu() >= 0, self.alphas_cumprod.gather(0, prev_timestep.cpu()), self.final_alpha_cumprod
+        prev_timestep.cpu() >= 0,
+        self.alphas_cumprod.gather(0, prev_timestep_index.cpu()),
+        self.final_alpha_cumprod,
     )
     alpha_prod_t = _left_broadcast(alpha_prod_t, sample.shape).to(sample.device)
     alpha_prod_t_prev = _left_broadcast(alpha_prod_t_prev, sample.shape).to(sample.device)
@@ -154,12 +162,18 @@ def ddim_step_with_logprob(
         prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
     # log prob of prev_sample given prev_sample_mean and std_dev_t, eq (7), eq (12)
+    # The final DDIM step is deterministic (zero variance) and has no finite
+    # Gaussian log density. Return a zero contribution for that action rather
+    # than producing NaN/Inf in an RL loss.
+    safe_std_dev_t = std_dev_t.clamp_min(torch.finfo(std_dev_t.dtype).eps)
     log_prob = (
-        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
-        - torch.log(std_dev_t)
+        -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (safe_std_dev_t**2))
+        - torch.log(safe_std_dev_t)
         - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
     )
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+    deterministic = (std_dev_t.reshape(std_dev_t.shape[0], -1).max(dim=1).values == 0)
+    log_prob = torch.where(deterministic, torch.zeros_like(log_prob), log_prob)
 
     return prev_sample.type(sample.dtype), log_prob

@@ -165,6 +165,27 @@ documented in [docs/RESEARCH.md](docs/RESEARCH.md).
 Direct checkpoint links and download behavior (without committing binaries) are
 listed in [CHECKPOINT_DOWNLOADS.md](CHECKPOINT_DOWNLOADS.md).
 
+### Runnable public RLFT workflow (not an exact Carve3D checkpoint reproduction)
+
+The original paper's Instant3D multi-view SDXL checkpoint and sparse-view LRM
+were not released. The paper explicitly says their released code leaves them as
+abstract functions, which is visible in this repository's `rewards.py` and
+`config/dgx.py`. Consequently, no command can truthfully recreate the reported
+Carve3DM weights from this source alone.
+
+For an executable public-model approximation, [code.txt](code.txt) now runs
+the direct four-capture evaluation, then a real on-policy LoRA RLFT cycle:
+
+```
+public MVDream -> 4 generated views -> public LGM -> bbox LPIPS MRC reward
+                -> reward-normalized score-function LoRA update -> post-RL MRC
+```
+
+It assigns MVDream/RL to GPU 0 and LGM/MRC to GPU 1 on Kaggle T4 x2. The
+default is one small RL epoch, not the paper's 55 epochs on 48 A100 80GB GPUs.
+Read [docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) before comparing results to the
+paper.
+
 ## Release TODOs
 - [ ] training and testing text prompt dataset
 - [x] SDXL LoRA training code adapted from [diffusers](https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_lora_sdxl.py) and [DDPO](https://github.com/kvablack/ddpo-pytorch)

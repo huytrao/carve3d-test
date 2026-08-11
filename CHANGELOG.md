@@ -27,6 +27,24 @@ All material pipeline changes are recorded here.
   names such as `view_90.png`, then passes the validated paths in fixed camera
   order to the reconstructor.
 
+## Unreleased — `open_rlft_full_pipeline`
+
+### Added
+
+- `open_mvdream_rlft.py`: executable open-model RLFT replacement using public
+  MVDream, public LGM, foreground-crop LPIPS MRC reward, an on-policy
+  score-function LoRA update, approximate KL control, checkpoint saving, and
+  post-RL evaluation across two T4 GPUs.
+- `docs/OPEN_RLFT.md`: exact paper-versus-public-replacement matrix and the
+  paper-scale compute limitation.
+
+### Changed
+
+- `code.txt` now runs direct four-photo reconstruction/MRC followed by the
+  public RLFT cycle, instead of the former prompt-only MVDream smoke test.
+- The DDIM log-probability helper handles the deterministic final DDIM action
+  without producing NaN/Inf during an RL update.
+
 ## Earlier work — `implement_full_pipeline`
 
 - Added a reproducible open LGM adapter for real four-view reconstruction,
