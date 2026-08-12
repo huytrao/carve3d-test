@@ -6,17 +6,19 @@ All material pipeline changes are recorded here.
 
 ### Changed
 
-- Add a quality-first staircase refinement profile initialized from the prior
-  run's best-validation LoRA rather than training again from zero or restoring
-  its epoch-55 last-safe checkpoint.
+- Add a quality-first staircase profile that explicitly initializes rank-4
+  LoRA at zero; it never consumes a checkpoint from the previous run.
 - Add ten target-aware training prompts and four disjoint validation prompts;
   keep the exact final staircase prompt out of both sets.
-- Use 30 continuation updates at `3e-5`, batch eight, validation every three
-  epochs over four seeds per prompt, best-validation restoration, and plateau
-  stopping. Skip the already-resolved 100-prompt curation stage.
-- Add `--initial-lora` with strict LoRA parameter validation. The loaded state
-  is the baseline/best checkpoint, providing a no-regression fallback when the
-  continuation does not improve held-out validation MRC.
+- Use up to 60 updates at an initial `1.5e-4`, batch eight, validation every
+  five epochs over four seeds per prompt, best-validation restoration, and
+  plateau stopping. Skip general-domain curation and spend the budget on six
+  balanced visits to every target-aware training prompt.
+- Add validation-driven LR annealing: halve the LR after two non-improving
+  validations down to `1e-5`, then stop after a sustained plateau.
+- Keep optional `--initial-lora` support in the general runner, but the V1
+  `code.txt` intentionally leaves it unset and clears only its own output
+  folder before every true from-scratch run.
 - Write a concise `training_summary.md` beside the JSON metrics.
 
 ## Unreleased — `import_direct_four_views`

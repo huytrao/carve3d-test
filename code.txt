@@ -11,6 +11,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,8 +30,7 @@ LGM_ROOT = WORKDIR / "LGM"
 INPUT_DIR = Path(os.environ.get("CARVE3D_INPUT_DIR", "/kaggle/input/datasets/traoanhuy/carve3d/views"))
 INPUT_DIR_FALLBACKS = (Path("/kaggle/input/carve3d/views"),)
 DIRECT_OUTPUT_DIR = WORKDIR / "carve3d-direct-four-view-calibrated-output"
-PREVIOUS_RLFT_OUTPUT_DIR = WORKDIR / "carve3d-paper-style-t4x2-output-v8"
-RLFT_OUTPUT_DIR = WORKDIR / "carve3d-staircase-refinement-t4x2-v1"
+RLFT_OUTPUT_DIR = WORKDIR / "carve3d-staircase-from-scratch-t4x2-v1"
 
 # This is the safe path for YOUR four photographs. It starts from LGM's
 # Gaussian prediction, then tests forward-only global colour/opacity/scale
@@ -46,13 +46,12 @@ RUN_DIRECT_RECONSTRUCTION = False  # Enable only when a fresh direct PLY is also
 # GPU 1 holds LGM/MRC.
 RUN_PROMPT_RLFT = True
 
-# V1 is a quality-first continuation of the completed v8 experiment. It keeps
-# batch 8, initializes from v8's best-validation LoRA (epoch 5 in the supplied
-# run), and trains a target-aware but disjoint family of staircase/stepped-frame
-# prompts. The exact final prompt remains held out. A lower learning rate and
-# best-validation restoration prevent epoch 31 from replacing the initial LoRA
-# unless held-out MRC really improves.
-RL_EPOCHS = 31  # Epoch 1 stat warmup + 30 updates = 3 balanced visits/prompt.
+# V1 convergence profile trains rank-4 LoRA from zero. It keeps batch 8 and a
+# target-aware but disjoint family of staircase/stepped-frame prompts. The exact
+# final prompt remains held out. Sixty updates revisit every training prompt six
+# times; validation-driven LR decay turns an MRC plateau into an explicit
+# convergence signal instead of silently continuing at a fixed learning rate.
+RL_EPOCHS = 61  # Epoch 1 stat warmup + 60 updates = 6 balanced visits/prompt.
 RL_SAMPLES_PER_EPOCH = 8
 RL_PROMPTS_PER_UPDATE = 1
 RL_CURATE_PROMPT_COUNT = 0  # V1 already has 10 target-aware prompts; skip 32-minute curation.
@@ -61,7 +60,7 @@ RL_CURATION_PREFILTER_COUNT = 0
 RL_PAPER_STAT_WARMUP = True
 RL_DDIM_STEPS = 30  # Official public MVDream/LGM text pipeline setting.
 RL_GUIDANCE_SCALE = 5.0  # Matches the paper; also supported by public MVDream.
-RL_LEARNING_RATE = 3e-5  # Conservative continuation LR; v8 used 7.5e-5 from the base model.
+RL_LEARNING_RATE = 1.5e-4  # From-zero T4 LR; KL/best-validation guards limit overshoot.
 RL_REWARD_COEFF = 1.0
 RL_KL_COEFF = 0.2
 RL_TIMESTEP_REDUCTION = "mean"
@@ -70,16 +69,18 @@ RL_STAT_BUFFER_EPOCHS = 3
 RL_KL_EARLY_STOP_THRESHOLD = 3.2e-4  # Paper value; logged explicitly because model scale differs.
 RL_MIN_VALIDATION_IMPROVEMENT = 1e-4
 RL_MRC_METRIC = "lpips"  # Paper metric. Use "l1" only when LPIPS download is blocked.
-RL_VALIDATION_EVERY = 3
+RL_VALIDATION_EVERY = 5
 RL_VALIDATION_SAMPLES_PER_PROMPT = 4  # Less seed noise than v8's two samples/prompt.
-RL_EARLY_STOP_PATIENCE = 5
+RL_EARLY_STOP_PATIENCE = 10  # Ten checks = up to 50 updates without a new best.
+RL_LR_PLATEAU_PATIENCE = 2
+RL_LR_DECAY_FACTOR = 0.5
+RL_MIN_LEARNING_RATE = 1e-5
 RL_CHECKPOINT_SELECTION = "best_validation"
 FINAL_CANDIDATES = 4
 
-# Keep this True for a real v8 -> v1 refinement. If the old Kaggle session was
-# closed, attach its output/checkpoints as a Kaggle Dataset or set
-# CARVE3D_V1_INITIAL_LORA=/kaggle/input/.../best_lora.pt.
-REQUIRE_PREVIOUS_BEST_LORA = True
+# True guarantees a clean run when the cell is executed again in one Kaggle
+# session. Only this V1 output folder is removed; old v8 results remain intact.
+RESET_RLFT_OUTPUT = True
 
 # V1 deliberately departs from the paper's general-domain curation after the
 # first run showed only 0.036% same-seed final transfer. These prompts train
@@ -134,6 +135,9 @@ if RUN_PROMPT_RLFT:
         "--checkpoint-selection",
         "--validation-samples-per-prompt",
         "--initial-lora",
+        "--lr-plateau-patience",
+        "--lr-decay-factor",
+        "--min-learning-rate",
     )
     missing_options = [option for option in required_options if option not in rlft_help]
     if missing_options:
@@ -156,37 +160,7 @@ print(
     f"Loaded v1 target-aware prompt set: {len(TRAIN_PROMPTS)} training prompts; "
     f"{len(VALIDATION_PROMPTS)} held-out validation prompts; exact final prompt held out."
 )
-
-
-def find_previous_best_lora() -> Path | None:
-    explicit = os.environ.get("CARVE3D_V1_INITIAL_LORA")
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit))
-    candidates.append(PREVIOUS_RLFT_OUTPUT_DIR / "checkpoints" / "best_lora.pt")
-    # Also recognize output directory names used by earlier iterations of this
-    # notebook and any unambiguous saved run in the current Kaggle session.
-    candidates.append(
-        WORKDIR / "carve3d-paper-faithful-t4x2-output-v6" / "checkpoints" / "best_lora.pt"
-    )
-    candidates.extend(sorted(WORKDIR.glob("carve3d-*-output*/checkpoints/best_lora.pt")))
-    # A saved Kaggle notebook output is commonly re-attached below /kaggle/input.
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.is_dir():
-        candidates.extend(sorted(kaggle_input.glob("**/checkpoints/best_lora.pt")))
-        candidates.extend(sorted(kaggle_input.glob("**/best_lora.pt")))
-    return next((path for path in candidates if path.is_file()), None)
-
-
-INITIAL_LORA = find_previous_best_lora()
-if RUN_PROMPT_RLFT and REQUIRE_PREVIOUS_BEST_LORA and INITIAL_LORA is None:
-    raise FileNotFoundError(
-        "V1 must start from the best LoRA produced by v8, but best_lora.pt was not found. "
-        "Keep the old output's checkpoints/best_lora.pt in /kaggle/working, "
-        "attach the old Kaggle output as a Dataset, or set CARVE3D_V1_INITIAL_LORA to its path."
-    )
-if INITIAL_LORA is not None:
-    print("V1 refinement initialization:", INITIAL_LORA)
+print("V1 initialization: base MVDream with zero LoRA (training from scratch).")
 
 def run_direct_reconstruction() -> None:
     global INPUT_DIR
@@ -287,14 +261,15 @@ rlft_command = [
     "--validation-every", str(RL_VALIDATION_EVERY),
     "--validation-samples-per-prompt", str(RL_VALIDATION_SAMPLES_PER_PROMPT),
     "--early-stop-patience", str(RL_EARLY_STOP_PATIENCE),
+    "--lr-plateau-patience", str(RL_LR_PLATEAU_PATIENCE),
+    "--lr-decay-factor", str(RL_LR_DECAY_FACTOR),
+    "--min-learning-rate", str(RL_MIN_LEARNING_RATE),
     "--checkpoint-selection", RL_CHECKPOINT_SELECTION,
     "--final-candidates", str(FINAL_CANDIDATES),
     # Pass this explicitly for compatibility with both the old Kaggle branch
     # runner and the new --target-prompt-aware runner.
     "--final-prompt", FINAL_EVAL_PROMPT,
 ]
-if INITIAL_LORA is not None:
-    rlft_command.extend(["--initial-lora", str(INITIAL_LORA)])
 if RL_PAPER_STAT_WARMUP:
     rlft_command.append("--paper-stat-warmup")
 for prompt in TRAIN_PROMPTS:
@@ -302,9 +277,12 @@ for prompt in TRAIN_PROMPTS:
 for prompt in VALIDATION_PROMPTS:
     rlft_command.extend(["--validation-prompt", prompt])
 if RUN_PROMPT_RLFT:
+    if RESET_RLFT_OUTPUT and RLFT_OUTPUT_DIR.is_dir():
+        print("Removing previous V1 output for a true from-scratch run:", RLFT_OUTPUT_DIR)
+        shutil.rmtree(RLFT_OUTPUT_DIR)
     print(
-        "Starting v1 quality refinement: previous best LoRA, 10 target-aware prompts, "
-        "one statistics-warmup epoch, then up to 30 on-policy updates with best-validation restoration."
+        "Starting V1 from zero LoRA: 10 target-aware prompts, one statistics-warmup epoch, "
+        "then up to 60 on-policy updates with LR decay, plateau stopping, and best-validation restoration."
     )
     subprocess.run(rlft_command, check=True)
 else:
@@ -320,3 +298,4 @@ if RUN_PROMPT_RLFT:
     print("Open RLFT output/checkpoint:", RLFT_OUTPUT_DIR)
     print("Post-RL MRC:", RLFT_OUTPUT_DIR / "rlft_metrics.json")
     print("Readable summary:", RLFT_OUTPUT_DIR / "training_summary.md")
+    print("Convergence curve:", RLFT_OUTPUT_DIR / "convergence_curve.csv")

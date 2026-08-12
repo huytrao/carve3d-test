@@ -10,6 +10,7 @@ from open_mvdream_rlft import (
     PerPromptRunningNormalizer,
     aggregate_prompt_evaluation_records,
     balanced_prompt_batches,
+    decayed_learning_rate,
     grouped_normalized_advantages,
     parse_args,
     render_training_summary,
@@ -83,6 +84,9 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertIsNone(args.test_prompts)
         self.assertIsNone(args.test_prompt_file)
         self.assertEqual(args.min_validation_improvement, 1e-4)
+        self.assertEqual(args.lr_plateau_patience, 0)
+        self.assertEqual(args.lr_decay_factor, 0.5)
+        self.assertEqual(args.min_learning_rate, 1e-6)
         self.assertEqual(args.final_candidates, 1)
         self.assertIsNone(args.kl_early_stop_threshold)
         self.assertEqual(args.checkpoint_selection, "best_validation")
@@ -114,6 +118,10 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(second[1], -1.341639, places=5)
         self.assertEqual(tracker.summary()["chair"]["count"], 4)
 
+    def test_plateau_learning_rate_decay_stops_at_configured_floor(self):
+        self.assertEqual(decayed_learning_rate(1.5e-4, 0.5, 1e-5), 7.5e-5)
+        self.assertEqual(decayed_learning_rate(1.2e-5, 0.5, 1e-5), 1e-5)
+
     def test_balanced_prompt_schedule_is_reproducible_and_near_uniform(self):
         prompts = [f"prompt-{index}" for index in range(10)]
         first = balanced_prompt_batches(prompts, updates=30, prompts_per_update=1, seed=42)
@@ -144,6 +152,15 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertNotIn(final_prompt, training)
         self.assertNotIn(final_prompt, validation)
 
+    def test_v1_kaggle_profile_restarts_from_zero_and_anneals_lr(self):
+        source = (Path(__file__).parents[1] / "code.txt").read_text(encoding="utf-8")
+        self.assertIn("RL_EPOCHS = 61", source)
+        self.assertIn("RL_LEARNING_RATE = 1.5e-4", source)
+        self.assertIn("RL_LR_PLATEAU_PATIENCE = 2", source)
+        self.assertIn('RL_CHECKPOINT_SELECTION = "best_validation"', source)
+        self.assertIn("RESET_RLFT_OUTPUT = True", source)
+        self.assertNotIn("INITIAL_LORA =", source)
+
     def test_training_summary_reports_no_regression_initial_checkpoint(self):
         metadata = {
             "baseline_validation": {"mean_mrc": 0.21},
@@ -154,6 +171,7 @@ class OpenRlftHelpersTest(unittest.TestCase):
             "selected_checkpoint_epoch": -1,
             "initialization": {"mode": "lora_checkpoint", "source": "/tmp/best_lora.pt"},
             "training_stop_reason": "validation_mrc_plateau",
+            "rl": {"learning_rate": 1.5e-4},
         }
         summary = render_training_summary(metadata)
         self.assertIn("initial LoRA (before v1 updates)", summary)

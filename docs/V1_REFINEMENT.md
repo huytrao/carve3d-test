@@ -1,9 +1,9 @@
-# V1 quality refinement from the completed T4 x2 run
+# V1 from-scratch convergence run on Kaggle T4 x2
 
-## Supplied baseline result
+## Why the previous run did not look converged
 
-Lower MRC is better. The completed v8 run was numerically stable, but its
-generalization gain was very small:
+Lower MRC is better. The completed run was stable but changed the policy only
+slightly:
 
 | Metric | Before RL | Best / after RL | Improvement |
 | --- | ---: | ---: | ---: |
@@ -12,55 +12,71 @@ generalization gain was very small:
 | Final same-seed mean MRC | 0.213262 | 0.213185 | 0.000077 (0.036%) |
 
 The four post-RL final MRC values were `0.183030`, `0.235778`, `0.159612`, and
-`0.274321`. The last update remained stable (`grad_norm=0.000851`,
-`replay_error=3.55e-4`, KL approximately `1e-5`), so this was not a crash or
-gradient explosion. The limiting issue was weak transfer to the final target.
+`0.274321`. The last update remained numerically stable
+(`grad_norm=0.000851`, `replay_error=3.55e-4`, KL approximately `1e-5`). This
+was not a crash or exploding-gradient failure. However, KL remaining close to
+zero and only `0.036%` final transfer show that the policy barely moved in a
+useful direction.
 
-The old runner restored `paper_last_safe` at epoch 55 even though epoch 5 had
-the lowest validation MRC. That setting follows the paper's KL-stop convention,
-but it is not the best choice for this small, noisy T4 experiment.
+The old output also selected `paper_last_safe` at epoch 55 although epoch 5 had
+the best held-out MRC. For a small T4 run, that makes the final model harder to
+interpret.
 
-## V1 changes
+## V1 experiment
 
-V1 is a target-specific continuation, not a claim of a new paper reproduction:
+V1 deliberately starts from base MVDream with zero LoRA. It does not load any
+checkpoint from the previous run.
 
-- Load v8 `checkpoints/best_lora.pt` as the starting policy. In the supplied
-  run, this is epoch 5 rather than epoch 55.
-- Treat that loaded LoRA as the no-regression baseline. If no continuation
-  checkpoint lowers held-out validation MRC, V1 returns the initial epoch-5
-  LoRA.
-- Replace unrelated machine/crane prompts with ten disjoint descriptions of
-  stairs, stepped platforms, and open braced frames. Four other staircase
-  descriptions select the checkpoint; the exact final prompt remains held out.
-- Retain eight same-prompt trajectories. Reducing to four would be faster but
-  would make the small-batch advantage estimate noisier.
-- Use `3e-5` instead of `7.5e-5` for continuation, validate every three epochs
-  with four fixed seeds per validation prompt, select `best_validation`, and
-  stop after five validation rounds without improvement.
-- Skip the 100-prompt curation pass because the V1 prompt family is fixed. This
-  removes roughly 32 minutes from the supplied timing without weakening each RL
-  update.
-- Write `training_summary.md` automatically alongside `rlft_metrics.json`.
+| Setting | V1 value | Reason |
+| --- | ---: | --- |
+| Paper epochs | 61 | One statistics warmup plus at most 60 optimizer updates |
+| Batch | 8 trajectories, one prompt | Preserve a usable per-prompt advantage estimate |
+| Training prompts | 10 staircase/stepped-frame variants | Optimize geometry relevant to the requested result |
+| Prompt visits | 6 per prompt | Twice the target-aware exposure of the earlier 30-update proposal |
+| Initial LR | `1.5e-4` | Move farther than the previous conservative `7.5e-5` run |
+| LR plateau rule | halve after 2 non-improving validations | Anneal instead of continuing forever at one LR |
+| Minimum LR | `1e-5` | Allow fine convergence after the larger initial updates |
+| Validation | every 5 epochs, 4 prompts x 4 fixed seeds | Reduce checkpoint-selection noise |
+| Plateau stop | 10 non-improving validations | Stop after LR annealing has had time to work |
+| Checkpoint | `best_validation` | Never publish a later checkpoint merely because its KL is safe |
+| KL guard | `3.2e-4` | Discard/stop before excessive policy drift |
 
-No method can guarantee a lower unseen-test MRC from a single stochastic run.
-V1's guarantee is narrower and testable: it will not replace the supplied best
-LoRA unless the fixed, held-out validation suite improves by at least `1e-4`.
+The ten training prompts, four validation prompts, and exact final prompt are
+disjoint. The final prompt never selects a checkpoint. Curation is skipped
+because the prompt family is already target-specific; the saved time is spent
+on twice as many useful optimizer updates.
 
-## Starting V1 on Kaggle
+The timestep loss remains a mean. The released trainer accumulates gradients
+across diffusion timesteps and effectively averages them; changing V1 to a sum
+would only multiply gradient magnitude and could create unstable, misleading
+movement rather than better convergence.
 
-Keep the previous checkpoint at:
+## Reading convergence
+
+`training_summary.md`, `rlft_metrics.json`, and `training_progress.json` are
+written under:
 
 ```text
-/kaggle/working/carve3d-paper-style-t4x2-output-v8/checkpoints/best_lora.pt
+/kaggle/working/carve3d-staircase-from-scratch-t4x2-v1
 ```
 
-If the old Kaggle session has ended, save/attach that output as a Kaggle Dataset
-and set the path before running `code.txt`:
+Use all of these conditions rather than training MRC alone:
 
-```python
-import os
-os.environ["CARVE3D_V1_INITIAL_LORA"] = "/kaggle/input/<dataset>/checkpoints/best_lora.pt"
-```
+1. Best held-out validation MRC must be below the base-policy validation MRC.
+2. The best should persist across fixed seeds instead of appearing in one
+   training batch.
+3. Learning rate should decay when validation plateaus; a later lower-LR
+   checkpoint should either improve or trigger early stopping.
+4. KL must remain below the guard, gradients must stay finite, and replay error
+   must remain small.
+5. Same-seed final mean MRC should also decrease. This last value is a test, not
+   a checkpoint-selection signal.
 
-The V1 output is written to
-`/kaggle/working/carve3d-staircase-refinement-t4x2-v1`.
+A single stochastic T4 run cannot guarantee a lower unseen-test MRC. The V1
+control flow guarantees that the published checkpoint is the lowest fixed-seed
+held-out validation checkpoint seen during the from-scratch run, with base
+MVDream retained if no update improves it.
+
+`code.txt` removes only the previous V1 output directory before launching so a
+second execution is also a genuine zero-LoRA run. It does not delete the old v8
+result.

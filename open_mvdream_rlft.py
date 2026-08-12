@@ -19,6 +19,7 @@ and is not a reasonable expectation for two T4s.
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import json
 import os
@@ -235,6 +236,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validation-every", type=int, default=2, help="Validate every N RL updates.")
     parser.add_argument("--early-stop-patience", type=int, default=4, help="Stop after this many validations without a lower MRC.")
+    parser.add_argument(
+        "--lr-plateau-patience",
+        type=int,
+        default=0,
+        help="Halve/decay LoRA learning rate after this many consecutive non-improving validations; zero disables it.",
+    )
+    parser.add_argument(
+        "--lr-decay-factor",
+        type=float,
+        default=0.5,
+        help="Learning-rate multiplier used by validation-plateau decay.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=1e-6,
+        help="Lower bound for validation-plateau learning-rate decay.",
+    )
     parser.add_argument(
         "--min-validation-improvement",
         type=float,
@@ -999,6 +1018,48 @@ def write_training_progress(destination: Path, **progress: Any) -> None:
     destination.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
 
+def decayed_learning_rate(current: float, factor: float, minimum: float) -> float:
+    """Return one bounded plateau-decay step."""
+
+    if current <= 0 or not 0 < factor < 1 or minimum <= 0:
+        raise ValueError("Learning-rate decay values must be positive and factor must be below one")
+    return max(minimum, current * factor)
+
+
+def write_convergence_curve(destination: Path, history: Sequence[dict[str, Any]]) -> None:
+    """Persist compact per-update diagnostics for plotting outside Kaggle."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fields = (
+        "paper_epoch",
+        "training_mrc",
+        "validation_mrc",
+        "validation_improvement",
+        "mean_kl_to_base",
+        "grad_norm",
+        "replay_max_abs_error",
+        "learning_rate",
+        "learning_rate_after_plateau",
+    )
+    with destination.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for record in history:
+            writer.writerow(
+                {
+                    "paper_epoch": int(record["epoch"]) + 1,
+                    "training_mrc": record["mean_mrc"],
+                    "validation_mrc": record.get("validation_mrc", ""),
+                    "validation_improvement": record.get("validation_improvement", ""),
+                    "mean_kl_to_base": record["mean_kl_to_base"],
+                    "grad_norm": record["grad_norm"],
+                    "replay_max_abs_error": record["replay_logprob_max_abs_error"],
+                    "learning_rate": record["learning_rate"],
+                    "learning_rate_after_plateau": record.get("learning_rate_after_plateau", ""),
+                }
+            )
+
+
 def render_training_summary(metadata: dict[str, Any]) -> str:
     """Create a compact human-readable report next to the machine metrics."""
 
@@ -1010,6 +1071,16 @@ def render_training_summary(metadata: dict[str, Any]) -> str:
     last = history[-1] if history else {}
     selected_epoch = int(metadata["selected_checkpoint_epoch"])
     initialization = metadata["initialization"]
+    validation_count = sum("validation_mrc" in record for record in history)
+    initial_learning_rate = float(metadata["rl"]["learning_rate"])
+    final_learning_rate = initial_learning_rate
+    for record in history:
+        final_learning_rate = float(
+            record.get(
+                "learning_rate_after_plateau",
+                record.get("learning_rate", final_learning_rate),
+            )
+        )
     selected_label = (
         "initial LoRA (before v1 updates)"
         if selected_epoch < 0 and initialization["mode"] == "lora_checkpoint"
@@ -1020,6 +1091,14 @@ def render_training_summary(metadata: dict[str, Any]) -> str:
         initialization_detail += f" from `{initialization['source']}`"
     validation_delta = baseline_validation - best_validation
     final_delta = baseline_final - final_mean
+    if validation_delta <= 0:
+        convergence_assessment = "no held-out improvement; base policy retained"
+    elif metadata["training_stop_reason"] == "validation_mrc_plateau":
+        convergence_assessment = "held-out MRC improved and then reached the configured plateau"
+    elif "kl_threshold" in metadata["training_stop_reason"]:
+        convergence_assessment = "held-out MRC improved, but training was limited by the KL guard"
+    else:
+        convergence_assessment = "held-out MRC improved; maximum training budget reached before plateau stop"
     return "\n".join(
         [
             "# RLFT training summary",
@@ -1035,6 +1114,9 @@ def render_training_summary(metadata: dict[str, Any]) -> str:
             f"- Selected checkpoint: {selected_label}",
             f"- Stop reason: `{metadata['training_stop_reason']}`",
             f"- Optimizer updates completed: {len(history)}",
+            f"- Held-out validation checks: {validation_count}",
+            f"- Learning rate: {initial_learning_rate:.2e} -> {final_learning_rate:.2e}",
+            f"- Convergence assessment: {convergence_assessment}",
             f"- Last sampled KL to base: {float(last.get('mean_kl_to_base', 0.0)):.6f}",
             f"- Last gradient norm: {float(last.get('grad_norm', 0.0)):.6f}",
             f"- Last replay max error: {float(last.get('replay_logprob_max_abs_error', 0.0)):.2e}",
@@ -1262,6 +1344,12 @@ def main() -> None:
         raise ValueError("--num-steps must be at least 2")
     if args.validation_every < 1 or args.early_stop_patience < 1:
         raise ValueError("--validation-every and --early-stop-patience must be at least 1")
+    if args.lr_plateau_patience < 0:
+        raise ValueError("--lr-plateau-patience cannot be negative")
+    if not 0 < args.lr_decay_factor < 1:
+        raise ValueError("--lr-decay-factor must be between zero and one")
+    if args.min_learning_rate <= 0 or args.min_learning_rate > args.learning_rate:
+        raise ValueError("--min-learning-rate must be positive and no greater than --learning-rate")
     if args.validation_samples_per_prompt < 1:
         raise ValueError("--validation-samples-per-prompt must be at least 1")
     if args.test_samples_per_prompt < 1:
@@ -1731,7 +1819,8 @@ def main() -> None:
         print(
             f"[RL {epoch + 1}/{args.epochs}] update complete: "
             f"mean_MRC={epoch_record['mean_mrc']:.6f}, mean_KL_base={epoch_record['mean_kl_to_base']:.6f}, "
-            f"grad_norm={update['grad_norm']:.6f}, replay_error={update['replay_logprob_max_abs_error']:.2e}",
+            f"grad_norm={update['grad_norm']:.6f}, replay_error={update['replay_logprob_max_abs_error']:.2e}, "
+            f"lr={epoch_record['learning_rate']:.2e}",
             flush=True,
         )
         should_validate = (
@@ -1820,6 +1909,26 @@ def main() -> None:
                     f"best={best_validation_mrc:.6f}; no-improvement={validations_without_improvement}",
                     flush=True,
                 )
+                should_decay_learning_rate = (
+                    args.lr_plateau_patience > 0
+                    and validations_without_improvement % args.lr_plateau_patience == 0
+                )
+                if should_decay_learning_rate:
+                    old_learning_rate = float(optimizer.param_groups[0]["lr"])
+                    new_learning_rate = decayed_learning_rate(
+                        old_learning_rate,
+                        args.lr_decay_factor,
+                        args.min_learning_rate,
+                    )
+                    if new_learning_rate < old_learning_rate:
+                        for parameter_group in optimizer.param_groups:
+                            parameter_group["lr"] = new_learning_rate
+                        epoch_record["learning_rate_after_plateau"] = new_learning_rate
+                        print(
+                            f"[RL {epoch + 1}/{args.epochs}] validation plateau: learning rate "
+                            f"{old_learning_rate:.2e} -> {new_learning_rate:.2e}",
+                            flush=True,
+                        )
                 if validations_without_improvement >= args.early_stop_patience:
                     training_stop_reason = "validation_mrc_plateau"
                     print("[RL] early stopping: validation MRC stopped improving.", flush=True)
@@ -1986,6 +2095,9 @@ def main() -> None:
             "validation_every": args.validation_every,
             "validation_samples_per_prompt": args.validation_samples_per_prompt,
             "early_stop_patience": args.early_stop_patience,
+            "lr_plateau_patience": args.lr_plateau_patience,
+            "lr_decay_factor": args.lr_decay_factor,
+            "min_learning_rate": args.min_learning_rate,
             "kl_early_stop_threshold": args.kl_early_stop_threshold,
             "min_validation_improvement": args.min_validation_improvement,
             "checkpoint_selection": args.checkpoint_selection,
@@ -2019,6 +2131,7 @@ def main() -> None:
         render_training_summary(metadata),
         encoding="utf-8",
     )
+    write_convergence_curve(args.output_dir / "convergence_curve.csv", history)
     write_training_progress(
         progress_file,
         status="completed",
