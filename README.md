@@ -219,6 +219,12 @@ It remains vastly below the paper's batch-768, 55-epoch training on 48 A100
 paper-to-public mapping and [docs/OPEN_RLFT.md](docs/OPEN_RLFT.md) for the
 earlier non-convergence diagnosis.
 
+The `open_rlft_full_pipeline_v1` continuation is documented in
+[docs/V1_REFINEMENT.md](docs/V1_REFINEMENT.md). It starts from a completed
+run's `best_lora.pt`, specializes on held-out staircase geometry, restores only
+the lowest-validation-MRC checkpoint, and keeps the input LoRA when no update
+improves the fixed validation suite.
+
 ## Release TODOs
 - [ ] training and testing text prompt dataset
 - [x] SDXL LoRA training code adapted from [diffusers](https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_lora_sdxl.py) and [DDPO](https://github.com/kvablack/ddpo-pytorch)

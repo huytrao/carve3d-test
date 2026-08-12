@@ -12,6 +12,7 @@ from open_mvdream_rlft import (
     balanced_prompt_batches,
     grouped_normalized_advantages,
     parse_args,
+    render_training_summary,
     resolve_prompt_configuration,
 )
 
@@ -89,6 +90,7 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertFalse(args.paper_stat_warmup)
         self.assertIsNone(args.target_prompt)
         self.assertIsNone(args.final_prompt)
+        self.assertIsNone(args.initial_lora)
         self.assertFalse(args.transactional_validation)
 
     def test_advantages_are_normalized_independently_per_prompt(self):
@@ -128,6 +130,35 @@ class OpenRlftHelpersTest(unittest.TestCase):
         self.assertEqual(len(set(candidates)), 100)
         self.assertNotIn(prompt_set["final_prompt"], candidates)
         self.assertEqual(len(prompt_set["validation_prompts"]), 4)
+
+    def test_v1_refinement_prompts_are_disjoint_and_target_aware(self):
+        prompt_set_path = Path(__file__).parents[1] / "prompt_sets" / "staircase_refinement_v1.json"
+        prompt_set = json.loads(prompt_set_path.read_text(encoding="utf-8"))
+        training = prompt_set["training_prompts"]
+        validation = prompt_set["validation_prompts"]
+        final_prompt = prompt_set["final_prompt"]
+        self.assertEqual(len(training), 10)
+        self.assertEqual(len(set(training)), 10)
+        self.assertEqual(len(validation), 4)
+        self.assertTrue(all("step" in prompt or "stair" in prompt or "tier" in prompt for prompt in training))
+        self.assertNotIn(final_prompt, training)
+        self.assertNotIn(final_prompt, validation)
+
+    def test_training_summary_reports_no_regression_initial_checkpoint(self):
+        metadata = {
+            "baseline_validation": {"mean_mrc": 0.21},
+            "best_validation_mrc": 0.21,
+            "baseline_final_selection": {"mean_mrc": 0.22},
+            "final_evaluation": {"mean_mrc": 0.22},
+            "history": [{"mean_kl_to_base": 1e-5, "grad_norm": 8e-4, "replay_logprob_max_abs_error": 3e-4}],
+            "selected_checkpoint_epoch": -1,
+            "initialization": {"mode": "lora_checkpoint", "source": "/tmp/best_lora.pt"},
+            "training_stop_reason": "validation_mrc_plateau",
+        }
+        summary = render_training_summary(metadata)
+        self.assertIn("initial LoRA (before v1 updates)", summary)
+        self.assertIn("0.000000 (0.000%)", summary)
+        self.assertIn("/tmp/best_lora.pt", summary)
 
     def test_prompt_evaluation_aggregation_combines_successive_curation_passes(self):
         records = [

@@ -138,6 +138,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=float, default=4.0)
+    parser.add_argument(
+        "--initial-lora",
+        type=Path,
+        help=(
+            "Optional LoRA-only checkpoint used to initialize a refinement run. The loaded state becomes the "
+            "no-regression validation baseline and is retained when no later update improves held-out MRC."
+        ),
+    )
     parser.add_argument("--reward-coeff", type=float, default=1.0)
     parser.add_argument(
         "--kl-coeff",
@@ -958,11 +966,83 @@ def restore_lora(unet: Any, state: dict[str, Any]) -> None:
         parameters[name].data.copy_(value.to(device=parameters[name].device, dtype=parameters[name].dtype))
 
 
+def load_lora(unet: Any, source: Path) -> dict[str, Any]:
+    """Load a LoRA-only checkpoint and validate it against this UNet."""
+
+    import torch
+
+    if not source.is_file():
+        raise FileNotFoundError(f"Initial LoRA checkpoint does not exist: {source}")
+    try:
+        state = torch.load(source, map_location="cpu", weights_only=True)
+    except TypeError:  # PyTorch before weights_only was introduced.
+        state = torch.load(source, map_location="cpu")
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"Initial LoRA checkpoint is not a non-empty state dictionary: {source}")
+    expected = set(lora_state(unet))
+    actual = set(state)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            "Initial LoRA parameter names do not match this MVDream UNet; "
+            f"missing={missing[:3]}, unexpected={unexpected[:3]}"
+        )
+    restore_lora(unet, state)
+    return lora_state(unet)
+
+
 def write_training_progress(destination: Path, **progress: Any) -> None:
     """Persist a compact status record after each costly RL milestone."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+
+
+def render_training_summary(metadata: dict[str, Any]) -> str:
+    """Create a compact human-readable report next to the machine metrics."""
+
+    baseline_validation = float(metadata["baseline_validation"]["mean_mrc"])
+    best_validation = float(metadata["best_validation_mrc"])
+    baseline_final = float(metadata["baseline_final_selection"]["mean_mrc"])
+    final_mean = float(metadata["final_evaluation"]["mean_mrc"])
+    history = metadata["history"]
+    last = history[-1] if history else {}
+    selected_epoch = int(metadata["selected_checkpoint_epoch"])
+    initialization = metadata["initialization"]
+    selected_label = (
+        "initial LoRA (before v1 updates)"
+        if selected_epoch < 0 and initialization["mode"] == "lora_checkpoint"
+        else ("base MVDream" if selected_epoch < 0 else f"paper epoch {selected_epoch + 1}")
+    )
+    initialization_detail = f"`{initialization['mode']}`"
+    if initialization.get("source"):
+        initialization_detail += f" from `{initialization['source']}`"
+    validation_delta = baseline_validation - best_validation
+    final_delta = baseline_final - final_mean
+    return "\n".join(
+        [
+            "# RLFT training summary",
+            "",
+            "> Lower MRC is better. The baseline in this file is the policy loaded at the start of this run.",
+            "",
+            "| Metric | Start | Selected/final | Improvement |",
+            "| --- | ---: | ---: | ---: |",
+            f"| Held-out validation MRC | {baseline_validation:.6f} | {best_validation:.6f} | {validation_delta:.6f} ({validation_delta / max(baseline_validation, 1e-12) * 100:.3f}%) |",
+            f"| Same-seed final mean MRC | {baseline_final:.6f} | {final_mean:.6f} | {final_delta:.6f} ({final_delta / max(baseline_final, 1e-12) * 100:.3f}%) |",
+            "",
+            f"- Initialization: {initialization_detail}",
+            f"- Selected checkpoint: {selected_label}",
+            f"- Stop reason: `{metadata['training_stop_reason']}`",
+            f"- Optimizer updates completed: {len(history)}",
+            f"- Last sampled KL to base: {float(last.get('mean_kl_to_base', 0.0)):.6f}",
+            f"- Last gradient norm: {float(last.get('grad_norm', 0.0)):.6f}",
+            f"- Last replay max error: {float(last.get('replay_logprob_max_abs_error', 0.0)):.2e}",
+            "",
+            "A positive improvement means MRC decreased. Checkpoint selection uses held-out validation only; the final prompt does not select the checkpoint.",
+            "",
+        ]
+    )
 
 
 def aggregate_prompt_evaluation_records(
@@ -1228,6 +1308,15 @@ def main() -> None:
     )
     import torch
 
+    initialization: dict[str, Any] = {"mode": "base_mvdream", "source": None}
+    if args.initial_lora is not None:
+        load_lora(pipe.unet, args.initial_lora)
+        initialization = {
+            "mode": "lora_checkpoint",
+            "source": str(args.initial_lora.resolve()),
+        }
+        print(f"[Initialization] loaded LoRA refinement baseline: {args.initial_lora}", flush=True)
+
     trainable = [parameter for parameter in pipe.unet.parameters() if parameter.requires_grad]
     # PyTorch AdamW defaults to weight_decay=1e-2, one hundred times the value
     # reported by Carve3D. Specify the paper optimizer values explicitly.
@@ -1406,6 +1495,7 @@ def main() -> None:
     best_validation_mrc = baseline_validation["mean_mrc"]
     best_epoch = -1
     best_state = lora_state(pipe.unet)
+    save_lora(pipe.unet, args.output_dir / "checkpoints" / "initial_lora.pt")
     save_lora(pipe.unet, args.output_dir / "checkpoints" / "best_lora.pt")
     last_safe_epoch = -1
     last_safe_state = lora_state(pipe.unet)
@@ -1766,8 +1856,13 @@ def main() -> None:
         selected_state = best_state
         selected_epoch = best_epoch
     restore_lora(pipe.unet, selected_state)
+    selected_label = (
+        "initial_lora"
+        if selected_epoch < 0 and initialization["mode"] == "lora_checkpoint"
+        else ("base_mvdream" if selected_epoch < 0 else f"paper_epoch_{selected_epoch + 1}")
+    )
     print(
-        f"[Checkpoint] selection={args.checkpoint_selection} epoch={selected_epoch + 1 if selected_epoch >= 0 else 0}",
+        f"[Checkpoint] selection={args.checkpoint_selection} selected={selected_label}",
         flush=True,
     )
     pipe.unet.eval()
@@ -1858,6 +1953,7 @@ def main() -> None:
         "mvdream_checkpoint": MVDREAM_CHECKPOINT,
         "lgm_checkpoint_url": LGM_CHECKPOINT_URL,
         "mvdream_to_lgm_order": list(MVDREAM_TO_LGM),
+        "initialization": initialization,
         "rl": {
             "algorithm": "one replay/update per sampled on-policy batch; REINFORCE-style score function",
             "lora_rank": args.lora_rank,
@@ -1919,6 +2015,10 @@ def main() -> None:
         "final_evaluation": final_selection,
     }
     (args.output_dir / "rlft_metrics.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (args.output_dir / "training_summary.md").write_text(
+        render_training_summary(metadata),
+        encoding="utf-8",
+    )
     write_training_progress(
         progress_file,
         status="completed",

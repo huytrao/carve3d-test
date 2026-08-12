@@ -1,0 +1,22 @@
+{
+  "description": "Target-aware T4 refinement prompts for the held-out industrial staircase. Training descriptions share useful stepped/open-frame geometry but never duplicate the final prompt.",
+  "training_prompts": [
+    "a portable gray steel four-step workshop stair unit with rectangular anti-slip treads, open side stringers, diagonal cross braces, and flat feet",
+    "a freestanding galvanized six-step warehouse access staircase with evenly spaced treads, triangular side supports, cross bracing, and base plates",
+    "a compact black metal three-step utility staircase with perforated rectangular treads, sloping side stringers, diagonal braces, and stabilizing feet",
+    "an open-frame industrial stair module with five steel grate treads, two inclined stringers, triangular support braces, and a rectangular base",
+    "a gray steel maintenance platform reached by five anti-slip steps, supported by square tubing, diagonal braces, and four flat mounting plates",
+    "a small aluminum loading stair with four deep rectangular steps, exposed side rails, crossed support bars, and wide non-slip feet",
+    "a tiered metal display stand with five rectangular shelves ascending in one direction, an open triangular frame, diagonal supports, and a flat base",
+    "a freestanding steel bleacher section with five rising tiers, box-section legs, triangular side frames, cross braces, and floor plates",
+    "a heavy-duty library step unit with four black tread pads, gray tubular side frames, diagonal bracing, and broad stabilizing feet",
+    "a miniature industrial staircase model with five evenly spaced steel steps, exposed stringers, an open cross-braced frame, and bolted base plates"
+  ],
+  "validation_prompts": [
+    "a freestanding dark gray four-step industrial staircase with rubber anti-slip treads, open triangular side frames, diagonal cross braces, and square feet",
+    "a galvanized steel six-step access stair with rectangular mesh treads, inclined stringers, crossed structural supports, and flat base plates",
+    "a compact metal workshop staircase with five uniform steps, black tread surfaces, exposed box-section framing, diagonal braces, and stable feet",
+    "an open-sided gray maintenance stair unit with five rectangular anti-slip steps, triangular supports, cross bracing, and a horizontal base frame"
+  ],
+  "final_prompt": "a freestanding gray steel five-step industrial staircase with black anti-slip rectangular treads, triangular cross-braced frame, and flat stabilizing feet"
+}

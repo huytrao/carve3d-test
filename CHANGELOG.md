@@ -2,6 +2,23 @@
 
 All material pipeline changes are recorded here.
 
+## Unreleased — `open_rlft_full_pipeline_v1`
+
+### Changed
+
+- Add a quality-first staircase refinement profile initialized from the prior
+  run's best-validation LoRA rather than training again from zero or restoring
+  its epoch-55 last-safe checkpoint.
+- Add ten target-aware training prompts and four disjoint validation prompts;
+  keep the exact final staircase prompt out of both sets.
+- Use 30 continuation updates at `3e-5`, batch eight, validation every three
+  epochs over four seeds per prompt, best-validation restoration, and plateau
+  stopping. Skip the already-resolved 100-prompt curation stage.
+- Add `--initial-lora` with strict LoRA parameter validation. The loaded state
+  is the baseline/best checkpoint, providing a no-regression fallback when the
+  continuation does not improve held-out validation MRC.
+- Write a concise `training_summary.md` beside the JSON metrics.
+
 ## Unreleased — `import_direct_four_views`
 
 ### Added
